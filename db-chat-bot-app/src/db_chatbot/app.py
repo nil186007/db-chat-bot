@@ -14,11 +14,9 @@ import pandas as pd
 from db_chatbot.core.database import DatabaseConnection
 from db_chatbot.core.sql_generator import SQLGenerator
 from db_chatbot.core.response_generator import ResponseGenerator
-from db_chatbot.utils.validators import SQLValidator
 from db_chatbot.handlers.query_handler import QueryHandler
-from db_chatbot.utils.result_processor import ResultProcessor
+from db_chatbot.agents.workflow_agent import WorkflowAgent
 from db_chatbot.config.settings import get_logger
-import json
 
 logger = get_logger(__name__)
 
@@ -40,18 +38,18 @@ if "db_conn" not in st.session_state:
     st.session_state.pending_query = None  # Store pending query awaiting confirmation
     logger.info("Session state initialized")
 
-# Always ensure query_handler and result_processor are initialized
+# Always ensure query_handler is initialized
 if "query_handler" not in st.session_state:
     st.session_state.query_handler = QueryHandler()
     logger.debug("QueryHandler initialized in session state")
 
-if "result_processor" not in st.session_state:
-    st.session_state.result_processor = ResultProcessor()
-    logger.debug("ResultProcessor initialized in session state")
-
 if "response_generator" not in st.session_state:
     st.session_state.response_generator = None
     logger.debug("ResponseGenerator placeholder initialized")
+
+if "workflow_agent" not in st.session_state:
+    st.session_state.workflow_agent = None
+    logger.debug("WorkflowAgent placeholder initialized")
 
 
 def reset_connection():
@@ -64,7 +62,7 @@ def reset_connection():
     st.session_state.schema_info = None
     st.session_state.messages = []
     st.session_state.pending_query = None
-    # Note: query_handler and result_processor are not reset as they're stateless
+    # Note: query_handler is not reset as it's stateless
 
 
 def main():
@@ -161,6 +159,9 @@ def main():
                 st.session_state.response_generator = ResponseGenerator(model_name=selected_model)
                 # Update query handler to use LLM classification
                 st.session_state.query_handler = QueryHandler(model_name=selected_model)
+                # Initialize workflow agent
+                # Workflow agent will be initialized when needed
+                # (requires db_conn to be connected first)
                 st.success(f"Loaded model: {selected_model}")
                 logger.info(f"Model {selected_model} loaded successfully")
             except Exception as e:
@@ -262,6 +263,16 @@ def main():
                                 message["content"] = f"Query execution failed: {error}"
                                 st.rerun()
             
+            # Show workflow steps if available
+            if message.get("steps"):
+                with st.expander("🔄 View Workflow Steps", expanded=False):
+                    for step in message["steps"]:
+                        step_status = step.get("status", "pending")
+                        step_icon = "✅" if step_status == "completed" else "❌" if step_status == "error" else "⏳"
+                        status_color = "green" if step_status == "completed" else "red" if step_status == "error" else "blue"
+                        st.markdown(f"{step_icon} **Step {step.get('step')}: {step.get('name')}**")
+                        st.markdown(f"  Status: :{status_color}[{step_status}] - {step.get('message', '')}")
+            
             # Show query results if available
             if message.get("query_results") is not None:
                 df = message.get("query_results")
@@ -292,7 +303,7 @@ def main():
                 })
                 st.rerun()
             
-            # Handle SQL queries
+            # Handle SQL queries using workflow agent
             elif query_type == 'sql_query':
                 if st.session_state.sql_generator is None:
                     st.warning("⚠️ Please load an LLM model from the sidebar first.")
@@ -302,133 +313,73 @@ def main():
                     })
                     st.rerun()
                 
-                with st.spinner("Analyzing your question and generating SQL query..."):
-                    logger.info("Starting SQL generation process")
-                    # Get conversation history for context
-                    conversation_history = [
-                        {k: v for k, v in msg.items() if k not in ["query_results", "pending_query"]}
-                        for msg in st.session_state.messages
-                    ]
-                    
-                    # Generate SQL query
-                    sql_query = st.session_state.sql_generator.generate_sql(
-                        natural_language_query=prompt,
+                # Initialize workflow agent if needed
+                if st.session_state.workflow_agent is None:
+                    st.session_state.workflow_agent = WorkflowAgent(
+                        sql_generator=st.session_state.sql_generator,
+                        db_connection=st.session_state.db_conn,
+                        response_generator=st.session_state.response_generator,
+                        query_classifier=st.session_state.query_classifier if hasattr(st.session_state, 'query_classifier') else None,
+                        max_retries=3
+                    )
+                
+                # Get conversation history
+                conversation_history = [
+                    {k: v for k, v in msg.items() if k not in ["query_results", "pending_query", "steps"]}
+                    for msg in st.session_state.messages
+                ]
+                
+                # Container for step-by-step progress
+                steps_container = st.container()
+                
+                # Run workflow agent
+                logger.info("Starting workflow agent")
+                with st.spinner("Processing your query through workflow..."):
+                    result = st.session_state.workflow_agent.run(
+                        user_query=prompt,
                         schema_info=st.session_state.schema_info,
                         conversation_history=conversation_history
                     )
-                    
-                    if sql_query:
-                        logger.info(f"SQL query generated: {sql_query[:50]}...")
-                        
-                        # Validate SQL query
-                        logger.info("Validating SQL query")
-                        is_valid, validation_error = SQLValidator.validate_query(sql_query)
-                        
-                        if not is_valid:
-                            error_msg = f"⚠️ Security validation failed: {validation_error}"
-                            st.error(error_msg)
-                            logger.warning(f"SQL validation failed: {validation_error}")
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": error_msg,
-                                "sql_query": sql_query
-                            })
-                            st.rerun()
-                        
-                        # Show the generated query and ask for confirmation
-                        st.markdown("**I've generated the following SQL query for your question:**")
-                        st.code(sql_query, language="sql")
-                        
-                        # Store pending query
-                        st.session_state.pending_query = {
-                            "sql": sql_query,
-                            "user_query": prompt
-                        }
-                        
-                        # Store in messages first
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": f"I've generated a SQL query for: '{prompt}'. Please review and confirm to execute it.",
-                            "sql_query": sql_query,
-                            "pending_query": True
-                        })
-                        
-                        # Confirmation buttons
-                        st.markdown("**Would you like to execute this query?**")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            execute_btn = st.button("✅ Execute Query", key=f"execute_{len(st.session_state.messages)}", use_container_width=True, type="primary")
-                        
-                        with col2:
-                            cancel_btn = st.button("❌ Cancel", key=f"cancel_{len(st.session_state.messages)}", use_container_width=True)
-                        
-                        if execute_btn:
-                            logger.info("User confirmed query execution")
-                            # Execute the query
-                            with st.spinner("Executing query..."):
-                                success, results, error = st.session_state.db_conn.execute_query(sql_query)
-                                
-                                if success and isinstance(results, dict) and "columns" in results:
-                                    # Process results to DataFrame
-                                    df = pd.DataFrame(results['rows'], columns=results['columns'])
-                                    
-                                    # Generate natural language response using LLM
-                                    conversation_history = [
-                                        {k: v for k, v in msg.items() if k not in ["query_results", "pending_query"]}
-                                        for msg in st.session_state.messages
-                                    ]
-                                    
-                                    if st.session_state.response_generator:
-                                        logger.info("Generating natural language response from query results")
-                                        nl_response = st.session_state.response_generator.generate_response(
-                                            user_query=prompt,
-                                            query_results=df,
-                                            sql_query=sql_query,
-                                            conversation_history=conversation_history
-                                        )
-                                    else:
-                                        # Fallback if response generator not available
-                                        nl_response = f"I found {len(df)} result(s) for your query."
-                                    
-                                    # Update the last message with LLM-generated response
-                                    st.session_state.messages[-1].update({
-                                        "content": nl_response,
-                                        "query_results": df,
-                                        "sql_query": sql_query,
-                                        "pending_query": False
-                                    })
-                                    st.session_state.pending_query = None
-                                    st.rerun()
-                                elif success:
-                                    st.session_state.messages[-1].update({
-                                        "content": "Query executed successfully.",
-                                        "pending_query": False
-                                    })
-                                    st.rerun()
-                                else:
-                                    st.error(f"Query execution failed: {error}")
-                                    st.session_state.messages[-1].update({
-                                        "content": f"Query execution failed: {error}",
-                                        "pending_query": False
-                                    })
-                                    st.rerun()
-                        
-                        if cancel_btn:
-                            logger.info("User cancelled query execution")
-                            st.session_state.pending_query = None
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": "Query cancelled. Feel free to ask another question!"
-                            })
-                            st.rerun()
-                    else:
-                        error_msg = "I couldn't generate a valid SQL query for your question. Please try rephrasing it or be more specific."
-                        st.error(error_msg)
-                        logger.warning("Failed to generate SQL query")
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": error_msg
-                        })
+                
+                # Display workflow steps
+                if result.get("steps"):
+                    with steps_container:
+                        st.markdown("### 🔄 Workflow Steps")
+                        for step in result["steps"]:
+                            step_status = step.get("status", "pending")
+                            step_icon = "⏳" if step_status == "in_progress" else "✅" if step_status == "completed" else "❌"
+                            status_color = "blue" if step_status == "in_progress" else "green" if step_status == "completed" else "red"
+                            
+                            with st.expander(f"{step_icon} Step {step.get('step')}: {step.get('name')}", expanded=True):
+                                st.markdown(f"**Status:** :{status_color}[{step_status}]")
+                                st.markdown(f"**Details:** {step.get('message', '')}")
+                
+                # Show SQL query if generated
+                if result.get("sql_query"):
+                    with st.expander("🔍 View Generated SQL Query", expanded=False):
+                        st.code(result["sql_query"], language="sql")
+                
+                # Display final response
+                final_response = result.get("final_response", "No response generated.")
+                st.markdown(f"**Response:** {final_response}")
+                
+                # Display results if available
+                if result.get("df") is not None:
+                    df = result["df"]
+                    if len(df) > 0:
+                        st.dataframe(df, use_container_width=True)
+                
+                # Store in messages
+                message_entry = {
+                    "role": "assistant",
+                    "content": final_response,
+                    "sql_query": result.get("sql_query"),
+                    "steps": result.get("steps", []),
+                    "query_results": result.get("df")
+                }
+                
+                st.session_state.messages.append(message_entry)
+                st.rerun()
 
 
 

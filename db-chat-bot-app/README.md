@@ -93,6 +93,13 @@ We've included a Docker Compose setup to quickly spin up a PostgreSQL database w
      - Username: `postgres`
      - Password: `postgres`
 
+4. **Access Neo4j Browser (optional):**
+   - Open http://localhost:7474 in your browser
+   - Login with:
+     - Username: `neo4j`
+     - Password: `neo4jpassword`
+   - Change password if prompted (for first-time setup)
+
 4. **Connect to the database in the chatbot:**
    - Host: `localhost`
    - Port: `5432`
@@ -119,6 +126,14 @@ The database is pre-populated with:
 - Multiple order items linking products to orders
 - 10 product reviews with ratings
 
+### Docker Services
+
+The Docker Compose setup includes:
+
+1. **PostgreSQL** (port 5432) - Main database
+2. **pgAdmin** (port 5050) - PostgreSQL web client
+3. **Neo4j** (ports 7474 HTTP, 7687 Bolt) - Knowledge graph database
+
 ### Docker Commands
 
 ```bash
@@ -133,6 +148,7 @@ docker-compose down
 
 # View logs
 docker-compose logs -f postgres
+docker-compose logs -f neo4j
 
 # Stop and remove all data (volumes)
 docker-compose down -v
