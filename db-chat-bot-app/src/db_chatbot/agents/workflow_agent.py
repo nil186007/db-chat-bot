@@ -1,12 +1,15 @@
 """
 Workflow-based SQL query agent with retry logic and step-by-step execution.
+Uses db_clients as tools, RAG for schema, and guardrails for validation.
 """
 from typing import List, Optional, Dict
 from db_chatbot.config.settings import get_logger
-from db_chatbot.utils.validators import SQLValidator
-from db_chatbot.core.sql_generator import SQLGenerator
-from db_chatbot.core.database import DatabaseConnection
-from db_chatbot.core.query_classifier import QueryClassifier
+from db_chatbot.guardrails.input_guardrails import InputGuardrails
+from db_chatbot.query_generator.sql_generator import SQLGenerator
+from db_chatbot.query_generator.response_generator import ResponseGenerator
+from db_chatbot.db_clients.postgres_client import PostgresClient
+from db_chatbot.rag.schema_rag import SchemaRAG
+from db_chatbot.query_intent.classifier import QueryClassifier
 import pandas as pd
 import ollama
 
@@ -19,8 +22,9 @@ class WorkflowAgent:
     def __init__(
         self,
         sql_generator: SQLGenerator,
-        db_connection: DatabaseConnection,
-        response_generator=None,
+        db_client: PostgresClient,  # Database client as tool
+        schema_rag: SchemaRAG,  # Schema RAG for schema retrieval
+        response_generator: Optional[ResponseGenerator] = None,
         query_classifier: Optional[QueryClassifier] = None,
         max_retries: int = 3
     ):
@@ -29,13 +33,15 @@ class WorkflowAgent:
         
         Args:
             sql_generator: SQL generator instance
-            db_connection: Database connection instance
+            db_client: Database client tool instance
+            schema_rag: Schema RAG instance for schema retrieval
             response_generator: Response generator instance (optional)
-            query_classifier: Query classifier instance (optional, will use sql_generator's model if not provided)
+            query_classifier: Query classifier instance (optional)
             max_retries: Maximum number of retry attempts
         """
         self.sql_generator = sql_generator
-        self.db_connection = db_connection
+        self.db_client = db_client  # Database client as tool
+        self.schema_rag = schema_rag  # Schema RAG for schema retrieval
         self.response_generator = response_generator
         self.query_classifier = query_classifier
         self.max_retries = max_retries
@@ -44,7 +50,6 @@ class WorkflowAgent:
     def run(
         self,
         user_query: str,
-        schema_info: Dict,
         conversation_history: List[Dict] = None
     ) -> Dict:
         """
@@ -52,7 +57,6 @@ class WorkflowAgent:
         
         Args:
             user_query: User's natural language query
-            schema_info: Database schema information
             conversation_history: Previous conversation messages
         
         Returns:
@@ -61,7 +65,7 @@ class WorkflowAgent:
         state = {
             "user_query": user_query,
             "query_type": None,
-            "schema_info": schema_info,
+            "schema_info": None,
             "sql_query": None,
             "validation_error": None,
             "execution_error": None,
@@ -84,15 +88,17 @@ class WorkflowAgent:
             state["steps"].append(step_info)
             logger.info(f"Step {step_num}: {name} - {status} - {message}")
         
-        # Step 1: Validate input and classify query
+        # Step 1: Validate input and classify query (using input guardrails and query intent)
         _log_step(1, "Input Validation & Classification", "in_progress", "Checking query type and guardrails...")
         
         # Use QueryClassifier if available, otherwise fallback to simple classification
         if self.query_classifier:
             try:
+                # Get schema from RAG for classification context
+                schema_info = self.schema_rag.get_schema()
                 needs_sql, reasoning = self.query_classifier.classify_query(
                     user_query,
-                    state["schema_info"],
+                    schema_info,
                     state["conversation_history"]
                 )
                 query_type = "sql_query" if needs_sql else "general_question"
@@ -119,19 +125,27 @@ class WorkflowAgent:
         
         _log_step(1, "Input Validation & Classification", "completed", "Query requires SQL generation")
         
-        # Step 2: Get schema from memory
-        _log_step(2, "Schema Retrieval", "in_progress", "Retrieving database schema...")
-        if not state["schema_info"]:
-            schema_info = self.db_connection.fetch_schema() if self.db_connection.connection else None
-            state["schema_info"] = schema_info
+        # Step 2: Get schema from RAG (database schema as RAG)
+        _log_step(2, "Schema Retrieval (RAG)", "in_progress", "Retrieving database schema from RAG...")
+        schema_info = self.schema_rag.get_schema()
         
-        if state["schema_info"]:
-            table_count = len(state["schema_info"].get("tables", []))
-            _log_step(2, "Schema Retrieval", "completed", f"Retrieved schema with {table_count} table(s)")
+        if schema_info:
+            table_count = len(schema_info.get("tables", []))
+            state["schema_info"] = schema_info
+            _log_step(2, "Schema Retrieval (RAG)", "completed", f"Retrieved schema with {table_count} table(s) from RAG")
         else:
-            _log_step(2, "Schema Retrieval", "error", "Failed to retrieve schema")
-            state["final_response"] = "Failed to retrieve database schema. Please check your connection."
-            return state
+            # Try to fetch from database client tool if not in RAG
+            _log_step(2, "Schema Retrieval (RAG)", "in_progress", "Schema not in RAG, fetching from database...")
+            schema_info = self.db_client.fetch_schema()
+            if schema_info:
+                self.schema_rag.load_schema(schema_info)  # Store in RAG for future use
+                table_count = len(schema_info.get("tables", []))
+                state["schema_info"] = schema_info
+                _log_step(2, "Schema Retrieval (RAG)", "completed", f"Fetched and stored schema with {table_count} table(s)")
+            else:
+                _log_step(2, "Schema Retrieval (RAG)", "error", "Failed to retrieve schema")
+                state["final_response"] = "Failed to retrieve database schema. Please check your connection."
+                return state
         
         # Step 3-N: Generate, validate, execute, retry loop
         retry_count = 0
@@ -159,12 +173,12 @@ class WorkflowAgent:
             state["sql_query"] = sql_query
             _log_step(step_num, "SQL Generation", "completed", f"Generated SQL query: {sql_query[:60]}...")
             
-            # Step 4: Validate SQL query
-            _log_step(step_num + 1, "SQL Validation", "in_progress", "Validating SQL query for security and syntax...")
-            is_valid, validation_error = SQLValidator.validate_query(sql_query)
+            # Step 4: Validate SQL query (using input guardrails)
+            _log_step(step_num + 1, "SQL Validation (Input Guardrails)", "in_progress", "Validating SQL query for security and syntax...")
+            is_valid, validation_error = InputGuardrails.validate_query(sql_query)
             
             if not is_valid:
-                _log_step(step_num + 1, "SQL Validation", "error", f"Validation failed: {validation_error}")
+                _log_step(step_num + 1, "SQL Validation (Input Guardrails)", "error", f"Validation failed: {validation_error}")
                 state["validation_error"] = validation_error
                 if retry_count < self.max_retries:
                     retry_count += 1
@@ -174,15 +188,15 @@ class WorkflowAgent:
                     state["final_response"] = f"SQL validation failed after {self.max_retries} attempts: {validation_error}"
                     return state
             
-            _log_step(step_num + 1, "SQL Validation", "completed", "SQL query passed validation")
+            _log_step(step_num + 1, "SQL Validation (Input Guardrails)", "completed", "SQL query passed validation")
             
-            # Step 5: Execute query
-            _log_step(step_num + 2, "Query Execution", "in_progress", "Executing SQL query...")
-            success, results, error = self.db_connection.execute_query(sql_query)
+            # Step 5: Execute query (using db_client tool)
+            _log_step(step_num + 2, "Query Execution (DB Client Tool)", "in_progress", "Executing SQL query...")
+            success, results, error = self.db_client.execute_query(sql_query)
             
             if success and results and "columns" in results:
                 row_count = len(results.get("rows", []))
-                _log_step(step_num + 2, "Query Execution", "completed", f"Query executed successfully. Returned {row_count} row(s)")
+                _log_step(step_num + 2, "Query Execution (DB Client Tool)", "completed", f"Query executed successfully. Returned {row_count} row(s)")
                 state["query_results"] = results
                 state["execution_error"] = None
                 
@@ -211,7 +225,7 @@ class WorkflowAgent:
             
             else:
                 # Execution failed - try to fix
-                _log_step(step_num + 2, "Query Execution", "error", f"Execution failed: {error}")
+                _log_step(step_num + 2, "Query Execution (DB Client Tool)", "error", f"Execution failed: {error}")
                 state["execution_error"] = error
                 
                 if retry_count < self.max_retries:
@@ -236,7 +250,7 @@ class WorkflowAgent:
         return state
     
     def _classify_query(self, user_query: str) -> str:
-        """Classify the query type."""
+        """Classify the query type (fallback method)."""
         query_lower = user_query.lower()
         
         # Check for greetings
@@ -284,4 +298,3 @@ Please generate a corrected SQL query that fixes the error. Only return the corr
         except Exception as e:
             logger.error(f"Error fixing query: {str(e)}")
             return None
-

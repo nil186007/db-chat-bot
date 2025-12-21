@@ -2,7 +2,7 @@
 LLM-based query classifier that determines if a query needs SQL generation.
 """
 import ollama
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 from db_chatbot.config.settings import get_logger
 
 logger = get_logger(__name__)
@@ -28,6 +28,25 @@ class QueryClassifier:
         Args:
             user_query: User's input query
             schema_info: Database schema information (optional)
+        
+        Returns:
+            Tuple of (needs_sql: bool, reasoning: str)
+        """
+        return self.classify_query(user_query, schema_info, [])
+    
+    def classify_query(
+        self,
+        user_query: str,
+        schema_info: Optional[Dict] = None,
+        conversation_history: Optional[List[Dict]] = None
+    ) -> Tuple[bool, str]:
+        """
+        Classify if the query needs SQL generation.
+        
+        Args:
+            user_query: User's input query
+            schema_info: Database schema information (optional)
+            conversation_history: Previous conversation messages (optional)
         
         Returns:
             Tuple of (needs_sql: bool, reasoning: str)

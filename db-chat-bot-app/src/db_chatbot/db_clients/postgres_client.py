@@ -1,22 +1,21 @@
 """
-Database connection and schema fetching module.
+PostgreSQL database client tool for the agent.
 """
 import psycopg2
 from psycopg2 import sql
 from typing import Dict, List, Optional, Tuple
-import streamlit as st
 from db_chatbot.config.settings import get_logger
 
 logger = get_logger(__name__)
 
 
-class DatabaseConnection:
-    """Handles PostgreSQL database connections and schema operations."""
+class PostgresClient:
+    """PostgreSQL database client tool for agent use."""
     
     def __init__(self):
+        """Initialize PostgreSQL client."""
         self.connection = None
-        self.schema_info = None
-        logger.info("DatabaseConnection instance created")
+        logger.info("PostgresClient instance created")
     
     def connect(self, host: str, port: int, database: str, user: str, password: str) -> Tuple[bool, str]:
         """
@@ -150,21 +149,19 @@ class DatabaseConnection:
                 schema_info["tables"].append(table_info)
             
             cursor.close()
-            self.schema_info = schema_info
             logger.info(f"Schema fetch completed successfully. Loaded {len(schema_info['tables'])} table(s)")
             return schema_info
             
         except psycopg2.Error as e:
             logger.error(f"Error fetching schema: {str(e)}")
-            st.error(f"Error fetching schema: {str(e)}")
             return None
     
-    def execute_query(self, query: str) -> Tuple[bool, Optional[List], Optional[str]]:
+    def execute_query(self, query: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Execute a SQL query and return results.
         
         Returns:
-            Tuple of (success: bool, results: List, error_message: str)
+            Tuple of (success: bool, results: Dict, error_message: str)
         """
         if not self.connection:
             logger.warning("Cannot execute query: not connected to database")
@@ -200,5 +197,4 @@ class DatabaseConnection:
             logger.info("Closing database connection")
             self.connection.close()
             self.connection = None
-            self.schema_info = None
 

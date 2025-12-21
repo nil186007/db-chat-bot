@@ -1,5 +1,5 @@
 """
-SQL validation and security guardrails.
+Input guardrails for SQL validation and security checks.
 """
 import re
 import sqlparse
@@ -11,8 +11,8 @@ from db_chatbot.config.settings import get_logger
 logger = get_logger(__name__)
 
 
-class SQLValidator:
-    """Validates SQL queries for security and compliance."""
+class InputGuardrails:
+    """Validates SQL queries for security and compliance (input guardrails)."""
     
     # Dangerous SQL keywords that should not be allowed
     FORBIDDEN_KEYWORDS = {
@@ -72,7 +72,7 @@ class SQLValidator:
                 # If no DML keyword found, check for forbidden keywords
                 if first_keyword is None:
                     query_upper = query.upper().strip()
-                    for keyword in SQLValidator.FORBIDDEN_KEYWORDS:
+                    for keyword in InputGuardrails.FORBIDDEN_KEYWORDS:
                         if keyword in query_upper:
                             logger.warning(f"Forbidden keyword '{keyword}' detected in query")
                             return False, f"Forbidden operation: {keyword} statements are not allowed. Only SELECT queries are permitted."
@@ -110,7 +110,7 @@ class SQLValidator:
         query_normalized = query.upper()
         
         # Check for forbidden keywords in the query
-        for keyword in SQLValidator.FORBIDDEN_KEYWORDS:
+        for keyword in InputGuardrails.FORBIDDEN_KEYWORDS:
             # Use word boundary to avoid false positives
             pattern = r'\b' + re.escape(keyword) + r'\b'
             if re.search(pattern, query_normalized, re.IGNORECASE):
@@ -118,7 +118,7 @@ class SQLValidator:
                 return False, f"Security violation: '{keyword}' keyword detected. Only SELECT queries are allowed."
         
         # Check for SQL injection patterns
-        for pattern in SQLValidator.SQL_INJECTION_PATTERNS:
+        for pattern in InputGuardrails.SQL_INJECTION_PATTERNS:
             if re.search(pattern, query_normalized, re.IGNORECASE):
                 logger.warning(f"Potential SQL injection detected: pattern '{pattern}'")
                 return False, "Security violation: Potential SQL injection detected."
@@ -140,12 +140,12 @@ class SQLValidator:
         logger.info("Starting comprehensive SQL validation")
         
         # Check for SQL injection
-        is_safe, error = SQLValidator.check_sql_injection(query)
+        is_safe, error = InputGuardrails.check_sql_injection(query)
         if not is_safe:
             return False, error
         
         # Check for SELECT-only
-        is_select, error = SQLValidator.validate_select_only(query)
+        is_select, error = InputGuardrails.validate_select_only(query)
         if not is_select:
             return False, error
         

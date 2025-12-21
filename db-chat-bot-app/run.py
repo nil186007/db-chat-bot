@@ -20,6 +20,6 @@ if __name__ == "__main__":
     env["PYTHONPATH"] = str(src_dir) + (os.pathsep + env.get("PYTHONPATH", ""))
     
     # Run the Streamlit app
-    app_path = src_dir / "db_chatbot" / "app.py"
+    app_path = src_dir / "db_chatbot" / "frontend" / "app.py"
     subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)], env=env)
 

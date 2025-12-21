@@ -1,0 +1,2 @@
+"""Frontend Streamlit application module."""
+

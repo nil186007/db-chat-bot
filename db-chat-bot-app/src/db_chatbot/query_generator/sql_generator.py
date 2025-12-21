@@ -76,7 +76,7 @@ class SQLGenerator:
         Format database schema information for the LLM prompt.
         
         Args:
-            schema_info: Schema dictionary from DatabaseConnection.fetch_schema()
+            schema_info: Schema dictionary from PostgresClient.fetch_schema()
         
         Returns:
             Formatted schema string
@@ -117,7 +117,7 @@ class SQLGenerator:
         
         Args:
             natural_language_query: User's natural language question
-            schema_info: Database schema information
+            schema_info: Database schema information (from RAG)
             conversation_history: Previous conversation messages for context
         
         Returns:
