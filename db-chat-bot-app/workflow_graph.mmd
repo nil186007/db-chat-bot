@@ -1,0 +1,30 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	classify_query(classify_query)
+	retrieve_schema(retrieve_schema)
+	generate_sql(generate_sql)
+	validate_sql(validate_sql)
+	execute_query(execute_query)
+	fix_query(fix_query)
+	generate_response(generate_response)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> classify_query;
+	fix_query --> validate_sql;
+	generate_response --> __end__;
+	generate_sql --> validate_sql;
+	retrieve_schema --> generate_sql;
+	classify_query -. &nbsp;sql_workflow&nbsp; .-> retrieve_schema;
+	classify_query -. &nbsp;end&nbsp; .-> __end__;
+	validate_sql -.-> fix_query;
+	validate_sql -.-> execute_query;
+	execute_query -.-> fix_query;
+	execute_query -.-> generate_response;
+	execute_query -. &nbsp;end&nbsp; .-> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

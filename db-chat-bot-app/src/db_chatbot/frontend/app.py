@@ -12,10 +12,13 @@ if str(app_dir) not in sys.path:
 import streamlit as st
 import pandas as pd
 from db_chatbot.db_clients.postgres_client import PostgresClient
+from db_chatbot.db_clients.neo4j_client import Neo4jClient
 from db_chatbot.query_generator.sql_generator import SQLGenerator
 from db_chatbot.query_generator.response_generator import ResponseGenerator
 from db_chatbot.query_intent.classifier import QueryClassifier
 from db_chatbot.rag.schema_rag import SchemaRAG
+from db_chatbot.rag.knowledge_graph_rag import KnowledgeGraphRAG
+from db_chatbot.handlers.annotation_handler import AnnotationHandler
 from db_chatbot.agents.workflow_agent import WorkflowAgent
 from db_chatbot.config.settings import get_logger
 
@@ -31,11 +34,19 @@ st.set_page_config(
 # Initialize session state
 if "db_client" not in st.session_state:
     st.session_state.db_client = PostgresClient()
+    st.session_state.neo4j_client = Neo4jClient()
+    st.session_state.neo4j_connected = False
+    st.session_state.neo4j_auto_connect_attempted = False
     st.session_state.connected = False
     st.session_state.schema_loaded = False
     st.session_state.sql_generator = None
     st.session_state.messages = []
+    st.session_state.annotation_handler = AnnotationHandler()
+    # Initialize SchemaRAG without KnowledgeGraphRAG initially
     st.session_state.schema_rag = SchemaRAG()
+    st.session_state.current_database_name = None
+    st.session_state.current_db_host = None
+    st.session_state.current_db_port = None
     logger.info("Session state initialized")
 
 if "response_generator" not in st.session_state:
@@ -58,7 +69,11 @@ def reset_connection():
         st.session_state.db_client.close()
     st.session_state.connected = False
     st.session_state.schema_loaded = False
-    st.session_state.schema_rag.clear()
+    if st.session_state.schema_rag and st.session_state.current_database_name:
+        st.session_state.schema_rag.clear()
+    st.session_state.current_database_name = None
+    st.session_state.current_db_host = None
+    st.session_state.current_db_port = None
     st.session_state.messages = []
     st.session_state.workflow_agent = None  # Reset workflow agent
 
@@ -71,6 +86,60 @@ def main():
     # Sidebar for connection settings
     with st.sidebar:
         st.header("⚙️ Settings")
+        
+        # Neo4j connection (for knowledge graph)
+        st.subheader("Knowledge Graph (Neo4j)")
+        
+        # Auto-connect to Neo4j on first load
+        if not st.session_state.neo4j_connected and not st.session_state.neo4j_auto_connect_attempted:
+            st.session_state.neo4j_auto_connect_attempted = True
+            with st.spinner("Attempting to connect to Neo4j..."):
+                try:
+                    success = st.session_state.neo4j_client.connect()
+                    if success:
+                        st.session_state.neo4j_connected = True
+                        # Initialize KnowledgeGraphRAG and update SchemaRAG
+                        kg_rag = KnowledgeGraphRAG(st.session_state.neo4j_client)
+                        st.session_state.schema_rag = SchemaRAG(knowledge_graph_rag=kg_rag)
+                        logger.info("Neo4j auto-connected and KnowledgeGraphRAG initialized")
+                except Exception as e:
+                    logger.warning(f"Auto-connect to Neo4j failed: {e}")
+                    st.session_state.neo4j_connected = False
+        
+        with st.form("neo4j_connection_form"):
+            neo4j_uri = st.text_input("Neo4j URI", value="bolt://localhost:7687", help="Neo4j connection URI (default: bolt://localhost:7687)")
+            neo4j_user = st.text_input("Neo4j User", value="neo4j")
+            neo4j_password = st.text_input("Neo4j Password", type="password", value="neo4jpassword", help="Default password: neo4jpassword (from docker-compose)")
+            neo4j_connect_button = st.form_submit_button("Connect to Neo4j", use_container_width=True)
+        
+        if neo4j_connect_button:
+            # Update client connection details
+            st.session_state.neo4j_client = Neo4jClient(uri=neo4j_uri, user=neo4j_user, password=neo4j_password)
+            with st.spinner("Connecting to Neo4j..."):
+                success = st.session_state.neo4j_client.connect()
+                if success:
+                    st.session_state.neo4j_connected = True
+                    st.success("✅ Neo4j connected!")
+                    # Initialize KnowledgeGraphRAG and update SchemaRAG
+                    kg_rag = KnowledgeGraphRAG(st.session_state.neo4j_client)
+                    st.session_state.schema_rag = SchemaRAG(knowledge_graph_rag=kg_rag)
+                    logger.info("Neo4j connected and KnowledgeGraphRAG initialized")
+                else:
+                    st.error("❌ Failed to connect to Neo4j. Make sure Neo4j is running (docker-compose up -d neo4j)")
+                    st.session_state.neo4j_connected = False
+        
+        if st.session_state.neo4j_connected:
+            st.success("🟢 Knowledge Graph: Active")
+            if st.button("Disconnect Neo4j", use_container_width=True):
+                st.session_state.neo4j_client.close()
+                st.session_state.neo4j_connected = False
+                st.session_state.schema_rag = SchemaRAG()  # Reset to in-memory
+                st.rerun()
+        else:
+            st.warning("🟡 Knowledge Graph: Not connected (using in-memory storage)")
+            st.caption("💡 Tip: Start Neo4j with: `cd docker-setup && docker-compose up -d neo4j`")
+        
+        st.divider()
         
         # Database connection form
         st.subheader("Database Connection")
@@ -105,10 +174,22 @@ def main():
                         logger.info("Starting schema fetch")
                         schema = st.session_state.db_client.fetch_schema()
                         if schema:
-                            st.session_state.schema_rag.load_schema(schema)  # Load into RAG
+                            # Store database connection info for knowledge graph
+                            st.session_state.current_database_name = db_name
+                            st.session_state.current_db_host = db_host
+                            st.session_state.current_db_port = int(db_port)
+                            
+                            # Load into RAG (with knowledge graph if connected)
+                            st.session_state.schema_rag.load_schema(
+                                schema,
+                                database_name=db_name,
+                                host=db_host,
+                                port=int(db_port)
+                            )
                             st.session_state.schema_loaded = True
-                            st.success(f"Loaded {len(schema['tables'])} table(s) into RAG")
-                            logger.info(f"Schema loaded successfully into RAG: {len(schema['tables'])} tables")
+                            storage_type = "Knowledge Graph" if st.session_state.neo4j_connected else "Memory"
+                            st.success(f"Loaded {len(schema['tables'])} table(s) into {storage_type}")
+                            logger.info(f"Schema loaded successfully into {storage_type}: {len(schema['tables'])} tables")
                         else:
                             st.error("Failed to load schema")
                             logger.error("Schema loading failed")
@@ -168,6 +249,112 @@ def main():
         # Show current model
         if st.session_state.sql_generator:
             st.info(f"📌 Current model: {st.session_state.sql_generator.model_name}")
+        
+        # Metadata Management Section
+        if st.session_state.schema_loaded and st.session_state.neo4j_connected:
+            st.divider()
+            st.subheader("📝 Metadata Management")
+            st.caption("Manage descriptions for database, tables, and columns. These descriptions enhance SQL generation context.")
+            
+            schema_info = st.session_state.schema_rag.get_schema()
+            if schema_info:
+                # Database Description
+                with st.expander("🗄️ Database Description", expanded=False):
+                    current_db_desc = st.session_state.schema_rag.get_annotation(
+                        "database",
+                        st.session_state.current_database_name or ""
+                    ) or ""
+                    
+                    db_description = st.text_area(
+                        "Database Description",
+                        value=current_db_desc,
+                        height=100,
+                        key="db_description",
+                        help="Describe what this database stores and its purpose"
+                    )
+                    if st.button("💾 Save Database Description", key="save_db_desc", use_container_width=True):
+                        st.session_state.schema_rag.add_annotation(
+                            entity_type="database",
+                            entity_name=st.session_state.current_database_name or "",
+                            content=db_description,
+                            table_name=None
+                        )
+                        st.success("✅ Database description saved!")
+                        st.rerun()
+                
+                # Table Descriptions
+                with st.expander("📋 Table Descriptions", expanded=False):
+                    table_options = [t["name"] for t in schema_info["tables"]]
+                    selected_table = st.selectbox(
+                        "Select Table",
+                        options=table_options,
+                        key="metadata_table_select"
+                    )
+                    
+                    if selected_table:
+                        # Get current annotation for selected table
+                        current_table_desc = st.session_state.schema_rag.get_annotation(
+                            "table",
+                            selected_table
+                        ) or ""
+                        
+                        table_description = st.text_area(
+                            f"Description for '{selected_table}' table",
+                            value=current_table_desc,
+                            height=150,
+                            key=f"table_desc_{selected_table}",
+                            help="Describe what this table stores, its purpose, and key information"
+                        )
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("💾 Save Table Description", key=f"save_table_{selected_table}", use_container_width=True):
+                                st.session_state.schema_rag.add_annotation(
+                                    entity_type="table",
+                                    entity_name=selected_table,
+                                    content=table_description,
+                                    table_name=None
+                                )
+                                st.success(f"✅ Description saved for table '{selected_table}'!")
+                                st.rerun()
+                        with col2:
+                            if st.button("🔄 View Columns", key=f"view_cols_{selected_table}", use_container_width=True):
+                                st.session_state[f"show_cols_{selected_table}"] = not st.session_state.get(f"show_cols_{selected_table}", False)
+                        
+                        # Show columns for selected table
+                        if st.session_state.get(f"show_cols_{selected_table}", False):
+                            selected_table_info = next((t for t in schema_info["tables"] if t["name"] == selected_table), None)
+                            if selected_table_info:
+                                st.markdown("**Columns:**")
+                                for col in selected_table_info["columns"]:
+                                    col_name = col["name"]
+                                    # Get current column annotation
+                                    current_col_desc = st.session_state.schema_rag.get_annotation(
+                                        "column",
+                                        col_name,
+                                        table_name=selected_table
+                                    ) or ""
+                                    
+                                    with st.expander(f"📌 {col_name} ({col['type']})", expanded=False):
+                                        col_description = st.text_area(
+                                            f"Description for column '{col_name}'",
+                                            value=current_col_desc,
+                                            height=100,
+                                            key=f"col_desc_{selected_table}_{col_name}",
+                                            help=f"Describe what this column stores (type: {col['type']})"
+                                        )
+                                        if st.button("💾 Save", key=f"save_col_{selected_table}_{col_name}", use_container_width=True):
+                                            st.session_state.schema_rag.add_annotation(
+                                                entity_type="column",
+                                                entity_name=col_name,
+                                                content=col_description,
+                                                table_name=selected_table
+                                            )
+                                            st.success(f"✅ Description saved for column '{col_name}'!")
+                                            st.rerun()
+        elif st.session_state.schema_loaded and not st.session_state.neo4j_connected:
+            st.divider()
+            st.info("💡 Connect to Neo4j to enable metadata management features")
         
         # Show schema info from RAG
         if st.session_state.schema_loaded:
@@ -236,6 +423,54 @@ def main():
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
+            # Check if this is an annotation
+            if st.session_state.annotation_handler.is_annotation(prompt):
+                logger.info("Detected annotation in user message")
+                annotation = st.session_state.annotation_handler.parse_annotation(prompt)
+                
+                if annotation and st.session_state.schema_loaded:
+                    # Store annotation in knowledge graph
+                    try:
+                        st.session_state.schema_rag.add_annotation(
+                            entity_type=annotation["entity_type"],
+                            entity_name=annotation["entity_name"],
+                            content=annotation["content"],
+                            table_name=annotation.get("table_name")
+                        )
+                        entity_desc = f"{annotation['entity_type']} '{annotation['entity_name']}'"
+                        if annotation.get("table_name"):
+                            entity_desc = f"column '{annotation['entity_name']}' in table '{annotation['table_name']}'"
+                        
+                        response = f"✅ Annotation saved for {entity_desc}:\n\n{annotation['content']}"
+                        st.success(response)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": response
+                        })
+                        logger.info(f"Annotation stored: {entity_desc}")
+                    except Exception as e:
+                        error_msg = f"❌ Failed to save annotation: {str(e)}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": error_msg
+                        })
+                        logger.error(f"Failed to store annotation: {e}")
+                elif not st.session_state.schema_loaded:
+                    st.warning("⚠️ Please connect to a database first before adding annotations.")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "⚠️ Please connect to a database first before adding annotations."
+                    })
+                else:
+                    st.warning("⚠️ Could not parse annotation. Please use format like:\n- 'The orders table contains customer purchase records'\n- 'The orders.status column stores order status values'")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "⚠️ Could not parse annotation. Please use format like:\n- 'The orders table contains customer purchase records'\n- 'The orders.status column stores order status values'"
+                    })
+                st.rerun()
+                return
+            
             if st.session_state.sql_generator is None:
                 st.warning("⚠️ Please load an LLM model from the sidebar first.")
                 st.session_state.messages.append({

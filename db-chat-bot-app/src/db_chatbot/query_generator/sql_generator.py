@@ -111,7 +111,7 @@ class SQLGenerator:
         logger.debug(f"Schema formatted: {len(schema_text)} characters")
         return schema_text
     
-    def generate_sql(self, natural_language_query: str, schema_info: Dict, conversation_history: list = None) -> Optional[str]:
+    def generate_sql(self, natural_language_query: str, schema_info: Dict, conversation_history: list = None, enhanced_context: str = None) -> Optional[str]:
         """
         Generate SQL query from natural language.
         
@@ -119,12 +119,19 @@ class SQLGenerator:
             natural_language_query: User's natural language question
             schema_info: Database schema information (from RAG)
             conversation_history: Previous conversation messages for context
+            enhanced_context: Enhanced schema context from knowledge graph (includes annotations)
         
         Returns:
             Generated SQL query string or None if generation fails
         """
         logger.info(f"Generating SQL for query: {natural_language_query[:50]}...")
-        schema_text = self.format_schema_for_prompt(schema_info)
+        
+        # Use enhanced context if provided (from knowledge graph), otherwise format from schema_info
+        if enhanced_context:
+            schema_text = enhanced_context
+            logger.debug("Using enhanced context from knowledge graph")
+        else:
+            schema_text = self.format_schema_for_prompt(schema_info)
         
         # Build conversation context
         context = ""
