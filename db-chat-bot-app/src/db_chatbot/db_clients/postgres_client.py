@@ -2,7 +2,7 @@
 PostgreSQL database client tool for the agent.
 """
 import psycopg2
-from psycopg2 import sql
+from psycopg2 import sql, extensions
 from typing import Dict, List, Optional, Tuple
 from db_chatbot.config.settings import get_logger
 
@@ -168,7 +168,18 @@ class PostgresClient:
             return False, None, "Not connected to database"
         
         logger.info(f"Executing query: {query[:100]}...")
+        cursor = None
         try:
+            # Rollback any previous failed transaction to ensure clean state
+            # This is important when retrying queries after a failure
+            try:
+                if self.connection.status == extensions.STATUS_IN_TRANSACTION:
+                    logger.debug("Rolling back previous transaction to ensure clean state")
+                    self.connection.rollback()
+            except Exception:
+                # If rollback fails, connection might be in bad state, try to reset
+                pass
+            
             cursor = self.connection.cursor()
             cursor.execute(query)
             
@@ -189,6 +200,24 @@ class PostgresClient:
                 
         except psycopg2.Error as e:
             logger.error(f"Query execution failed: {str(e)}")
+            # Rollback the transaction on error to allow subsequent queries
+            # This is critical for retry logic to work properly
+            try:
+                if cursor:
+                    cursor.close()
+                # Always attempt rollback on error to reset transaction state
+                try:
+                    if self.connection.status == extensions.STATUS_IN_TRANSACTION:
+                        logger.debug("Rolling back transaction after error")
+                        self.connection.rollback()
+                    else:
+                        # Even if not in transaction, try rollback to be safe
+                        self.connection.rollback()
+                except Exception as rollback_inner:
+                    # If rollback also fails, log but don't fail
+                    logger.warning(f"Rollback failed (may be expected): {str(rollback_inner)}")
+            except Exception as rollback_error:
+                logger.warning(f"Error during cleanup after query failure: {str(rollback_error)}")
             return False, None, str(e)
     
     def close(self):

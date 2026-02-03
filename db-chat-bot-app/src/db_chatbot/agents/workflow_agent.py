@@ -69,7 +69,7 @@ class WorkflowAgent:
         
         logger.info(f"WorkflowAgent initialized with LangGraph, max_retries={max_retries}")
     
-    def _log_step(self, state: AgentState, step_num: int, name: str, status: str, message: str):
+    def _log_step(self, state: AgentState, step_num: int, name: str, status: str, message: str, sql_query: str = None, error: str = None):
         """Log a workflow step to the state."""
         if "steps" not in state:
             state["steps"] = []
@@ -80,6 +80,10 @@ class WorkflowAgent:
             "status": status,
             "message": message
         }
+        if sql_query:
+            step_info["sql_query"] = sql_query
+        if error:
+            step_info["error"] = error
         state["steps"].append(step_info)
         logger.info(f"Step {step_num}: {name} - {status} - {message}")
     
@@ -203,8 +207,9 @@ class WorkflowAgent:
             return state
         
         state["sql_query"] = sql_query
-        self._log_step(state, step_num, "SQL Generation", "completed", 
-                      f"Generated SQL query: {sql_query[:60]}...")
+        retry_label = f" (Retry {retry_count})" if retry_count > 0 else ""
+        self._log_step(state, step_num, f"SQL Generation{retry_label}", "completed", 
+                      f"Generated SQL query: {sql_query[:60]}...", sql_query=sql_query)
         return state
     
     def _validate_sql_node(self, state: AgentState) -> AgentState:
@@ -220,7 +225,8 @@ class WorkflowAgent:
         
         if not is_valid:
             self._log_step(state, step_num, "SQL Validation (Input Guardrails)", "error", 
-                          f"Validation failed: {validation_error}")
+                          f"Validation failed: {validation_error}", 
+                          sql_query=sql_query, error=validation_error)
             state["validation_error"] = validation_error
             return state
         
@@ -264,7 +270,8 @@ class WorkflowAgent:
             return state
         else:
             self._log_step(state, step_num, "Query Execution (DB Client Tool)", "error", 
-                          f"Execution failed: {error}")
+                          f"Execution failed: {error}", 
+                          sql_query=sql_query, error=error)
             state["execution_error"] = error
             return state
     
@@ -292,21 +299,27 @@ class WorkflowAgent:
         state["retry_count"] = retry_count + 1
         
         step_num = 3 + (retry_count * 2) + 2
-        self._log_step(state, step_num, f"Query Fix (Attempt {retry_count + 1}/{self.max_retries})", 
-                      "in_progress", "Attempting to fix SQL query...")
         
         failed_query = state.get("sql_query")
         error = state.get("execution_error") or state.get("validation_error")
         user_query = state["user_query"]
         
+        # Log the failed query first
+        self._log_step(state, step_num, f"Query Fix (Attempt {retry_count + 1}/{self.max_retries})", 
+                      "in_progress", f"Attempting to fix SQL query. Previous error: {error[:100] if error else 'Unknown error'}...",
+                      sql_query=failed_query, error=error)
+        
         fixed_query = self._fix_query(failed_query, error, user_query)
         if fixed_query and fixed_query != failed_query:
             state["sql_query"] = fixed_query
-            self._log_step(state, step_num, f"Query Fix (Attempt {retry_count + 1}/{self.max_retries})", 
-                          "completed", f"Generated fixed query: {fixed_query[:60]}...")
+            # Log the fixed query
+            self._log_step(state, step_num + 1, f"Query Fixed (Attempt {retry_count + 1}/{self.max_retries})", 
+                          "completed", f"Successfully generated new SQL query", 
+                          sql_query=fixed_query)
         else:
-            self._log_step(state, step_num, f"Query Fix (Attempt {retry_count + 1}/{self.max_retries})", 
-                          "error", "Could not fix query")
+            self._log_step(state, step_num + 1, f"Query Fix Failed (Attempt {retry_count + 1}/{self.max_retries})", 
+                          "error", "Could not generate a fixed query", 
+                          sql_query=failed_query, error=error)
         
         return state
     

@@ -25,17 +25,18 @@ class KnowledgeGraphRAG:
         self.neo4j = neo4j_client
         logger.info("KnowledgeGraphRAG initialized")
     
-    def build_graph_from_schema(self, schema_info: Dict, database_name: str, host: str, port: int):
+    def build_graph_from_schema(self, schema_info: Dict, database_name: str, host: str, port: int, db_type: str = "postgresql"):
         """
-        Build knowledge graph from PostgreSQL schema information.
+        Build knowledge graph from database schema information.
         
         Args:
-            schema_info: Schema dictionary from PostgresClient.fetch_schema()
+            schema_info: Schema dictionary from PostgresClient.fetch_schema() or MongoDBClient.fetch_schema()
             database_name: Name of the database
             host: Database host
             port: Database port
+            db_type: Database type ("postgresql" or "mongodb")
         """
-        logger.info(f"Building knowledge graph for database: {database_name}")
+        logger.info(f"Building knowledge graph for {db_type} database: {database_name}")
         
         # Clear existing graph for this database
         self.clear_database_graph(database_name)
@@ -46,6 +47,9 @@ class KnowledgeGraphRAG:
             name: $name,
             host: $host,
             port: $port,
+            db_type: $db_type,
+            description: "",
+            query_examples: [],
             created_at: datetime()
         })
         RETURN db
@@ -53,24 +57,32 @@ class KnowledgeGraphRAG:
         self.neo4j.execute_query(db_query, {
             "name": database_name,
             "host": host,
-            "port": port
+            "port": port,
+            "db_type": db_type
         })
         
-        # Process tables
-        for table in schema_info.get("tables", []):
-            self._create_table_node(database_name, table)
-        
-        logger.info(f"Knowledge graph built: {len(schema_info.get('tables', []))} table(s) added")
+        if db_type == "mongodb":
+            # Process MongoDB collections
+            for collection in schema_info.get("collections", []):
+                self._create_mongodb_collection_node(database_name, collection)
+            logger.info(f"Knowledge graph built: {len(schema_info.get('collections', []))} collection(s) added")
+        else:
+            # Process PostgreSQL tables
+            for table in schema_info.get("tables", []):
+                self._create_table_node(database_name, table)
+            logger.info(f"Knowledge graph built: {len(schema_info.get('tables', []))} table(s) added")
     
     def _create_table_node(self, database_name: str, table_info: Dict):
         """Create table node and related nodes/relationships."""
         table_name = table_info["name"]
         
-        # Create table node
+        # Create table node with description property
         table_query = """
         MATCH (db:Database {name: $db_name})
         CREATE (t:Table {
             name: $table_name,
+            description: "",
+            query_examples: [],
             created_at: datetime(),
             database_name: $db_name
         })
@@ -92,6 +104,8 @@ class KnowledgeGraphRAG:
                 nullable: $nullable,
                 default_value: $default,
                 max_length: $max_length,
+                description: "",
+                query_examples: [],
                 created_at: datetime(),
                 database_name: $db_name,
                 table_name: $table_name
@@ -137,6 +151,59 @@ class KnowledgeGraphRAG:
                 "from_col": fk["column"],
                 "to_col": fk["references_column"],
                 "db_name": database_name
+            })
+    
+    def _create_mongodb_collection_node(self, database_name: str, collection_info: Dict):
+        """Create MongoDB collection node and related nodes/relationships."""
+        collection_name = collection_info["name"]
+        
+        # Create collection node
+        collection_query = """
+        MATCH (db:Database {name: $db_name})
+        CREATE (c:Collection {
+            name: $collection_name,
+            document_count: $doc_count,
+            description: "",
+            query_examples: [],
+            created_at: datetime(),
+            database_name: $db_name,
+            db_type: "mongodb"
+        })
+        CREATE (db)-[:HAS_COLLECTION]->(c)
+        RETURN c
+        """
+        self.neo4j.execute_query(collection_query, {
+            "db_name": database_name,
+            "collection_name": collection_name,
+            "doc_count": collection_info.get("document_count", 0)
+        })
+        
+        # Create field nodes
+        for field in collection_info.get("fields", []):
+            field_query = """
+            MATCH (c:Collection {name: $collection_name, database_name: $db_name})
+            CREATE (f:Field {
+                name: $field_name,
+                types: $types,
+                nullable: $nullable,
+                example: $example,
+                description: "",
+                query_examples: [],
+                created_at: datetime(),
+                database_name: $db_name,
+                collection_name: $collection_name,
+                db_type: "mongodb"
+            })
+            CREATE (c)-[:HAS_FIELD]->(f)
+            RETURN f
+            """
+            self.neo4j.execute_query(field_query, {
+                "collection_name": collection_name,
+                "db_name": database_name,
+                "field_name": field["name"],
+                "types": field.get("types", []),
+                "nullable": field.get("nullable", False),
+                "example": field.get("example")
             })
     
     def add_annotation(
@@ -317,6 +384,141 @@ class KnowledgeGraphRAG:
         
         logger.debug(f"Annotation added/updated for {entity_type}: {entity_name}")
     
+    def get_mongodb_schema_context(
+        self,
+        query_keywords: Optional[List[str]] = None,
+        collection_names: Optional[List[str]] = None,
+        database_name: Optional[str] = None
+    ) -> str:
+        """
+        Retrieve MongoDB schema context from knowledge graph.
+        
+        Args:
+            query_keywords: Keywords to search for relevant collections/fields
+            collection_names: Specific collection names to retrieve
+            database_name: Database name filter
+        
+        Returns:
+            Formatted schema context string
+        """
+        logger.debug(f"Retrieving MongoDB schema context for collections: {collection_names}, keywords: {query_keywords}")
+        
+        if collection_names:
+            # Retrieve specific collections
+            cypher_query = """
+            MATCH (c:Collection {database_name: $db_name, db_type: "mongodb"})
+            WHERE c.name IN $collection_names
+            OPTIONAL MATCH (c)-[:HAS_FIELD]->(f:Field)
+            OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
+            OPTIONAL MATCH (field_ann:UserAnnotation)-[:DESCRIBES]->(f)
+            WHERE field_ann.entity_type = 'field'
+            WITH c, collect(DISTINCT f) as fields, 
+                 collect(DISTINCT ann.content) as collection_annotations,
+                 collect(DISTINCT field_ann) as field_annotations
+            RETURN c.name as collection_name, c.description as collection_description,
+                   c.document_count as document_count,
+                   fields, collection_annotations, field_annotations
+            ORDER BY c.name
+            """
+            results = self.neo4j.execute_query(cypher_query, {
+                "db_name": database_name,
+                "collection_names": collection_names
+            })
+        elif query_keywords:
+            # Search by keywords
+            cypher_query = """
+            MATCH (c:Collection {database_name: $db_name, db_type: "mongodb"})
+            WHERE ANY(keyword IN $keywords WHERE c.name CONTAINS keyword OR 
+                     EXISTS((c)-[:HAS_FIELD]->(f:Field {name: keyword})))
+            OPTIONAL MATCH (c)-[:HAS_FIELD]->(f:Field)
+            WHERE ANY(keyword IN $keywords WHERE f.name CONTAINS keyword)
+            OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
+            OPTIONAL MATCH (field_ann:UserAnnotation)-[:DESCRIBES]->(f)
+            WHERE field_ann.entity_type = 'field'
+            WITH c, collect(DISTINCT f) as fields,
+                 collect(DISTINCT ann.content) as collection_annotations,
+                 collect(DISTINCT field_ann) as field_annotations
+            RETURN c.name as collection_name, c.description as collection_description,
+                   c.document_count as document_count,
+                   fields, collection_annotations, field_annotations
+            ORDER BY c.name
+            LIMIT 10
+            """
+            results = self.neo4j.execute_query(cypher_query, {
+                "db_name": database_name,
+                "keywords": query_keywords
+            })
+        else:
+            # Retrieve all collections
+            cypher_query = """
+            MATCH (c:Collection {database_name: $db_name, db_type: "mongodb"})
+            OPTIONAL MATCH (c)-[:HAS_FIELD]->(f:Field)
+            OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
+            OPTIONAL MATCH (field_ann:UserAnnotation)-[:DESCRIBES]->(f)
+            WHERE field_ann.entity_type = 'field'
+            WITH c, collect(DISTINCT f) as fields,
+                 collect(DISTINCT ann.content) as collection_annotations,
+                 collect(DISTINCT field_ann) as field_annotations
+            RETURN c.name as collection_name, c.description as collection_description,
+                   c.document_count as document_count,
+                   fields, collection_annotations, field_annotations
+            ORDER BY c.name
+            """
+            results = self.neo4j.execute_query(cypher_query, {
+                "db_name": database_name
+            })
+        
+        # Format results
+        context = "MongoDB Database Schema:\n\n"
+        for record in results:
+            collection_name = record["collection_name"]
+            fields = record.get("fields", [])
+            collection_annotations = record.get("collection_annotations", [])
+            field_annotations = record.get("field_annotations", [])
+            collection_description = record.get("collection_description", "")
+            document_count = record.get("document_count", 0)
+            
+            context += f"Collection: {collection_name}\n"
+            context += f"Document Count: {document_count}\n"
+            
+            # Add collection description (includes query examples)
+            if collection_description:
+                context += f"Description: {collection_description}\n"
+            
+            # Add collection annotations
+            if collection_annotations:
+                for ann in collection_annotations:
+                    if ann:
+                        context += f"Additional Notes: {ann}\n"
+            
+            context += "Fields:\n"
+            for field in fields:
+                if field:
+                    field_name = field.get("name", "")
+                    types = field.get("types", [])
+                    nullable = " (nullable)" if field.get("nullable") else ""
+                    example = field.get("example")
+                    
+                    field_info = f"  - {field_name}: {', '.join(types)}{nullable}"
+                    if example:
+                        field_info += f" (example: {example})"
+                    context += field_info + "\n"
+                    
+                    # Add field description
+                    field_desc = field.get("description", "")
+                    if field_desc:
+                        context += f"    Description: {field_desc}\n"
+                    
+                    # Add field annotations
+                    for field_ann in field_annotations:
+                        if field_ann and field_ann.get("entity_name") == field_name:
+                            context += f"    Additional Notes: {field_ann.get('content', '')}\n"
+            
+            context += "\n"
+        
+        logger.debug(f"MongoDB schema context retrieved: {len(context)} characters")
+        return context
+    
     def get_schema_context(
         self,
         query_keywords: Optional[List[str]] = None,
@@ -348,7 +550,8 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns, 
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, columns, table_annotations, column_annotations
+            RETURN t.name as table_name, t.description as table_description,
+                   columns, table_annotations, column_annotations
             ORDER BY t.name
             """
             results = self.neo4j.execute_query(cypher_query, {
@@ -369,7 +572,8 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns,
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, columns, table_annotations, column_annotations
+            RETURN t.name as table_name, t.description as table_description,
+                   columns, table_annotations, column_annotations
             ORDER BY t.name
             LIMIT 10
             """
@@ -388,7 +592,8 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns,
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, columns, table_annotations, column_annotations
+            RETURN t.name as table_name, t.description as table_description,
+                   columns, table_annotations, column_annotations
             ORDER BY t.name
             """
             results = self.neo4j.execute_query(cypher_query, {
@@ -402,14 +607,19 @@ class KnowledgeGraphRAG:
             columns = record.get("columns", [])
             table_annotations = record.get("table_annotations", [])
             column_annotations = record.get("column_annotations", [])
+            table_description = record.get("table_description", "")
             
             context += f"Table: {table_name}\n"
+            
+            # Add table description (includes query examples)
+            if table_description:
+                context += f"Description: {table_description}\n"
             
             # Add table annotations
             if table_annotations:
                 for ann in table_annotations:
                     if ann:
-                        context += f"Description: {ann}\n"
+                        context += f"Additional Notes: {ann}\n"
             
             context += "Columns:\n"
             for col in columns:
@@ -428,10 +638,15 @@ class KnowledgeGraphRAG:
                         col_info += f" DEFAULT {default}"
                     context += col_info + "\n"
                     
+                    # Add column description (includes query examples)
+                    col_desc = col.get("description", "")
+                    if col_desc:
+                        context += f"    Description: {col_desc}\n"
+                    
                     # Add column annotations
                     for col_ann in column_annotations:
                         if col_ann and col_ann.get("entity_name") == col_name:
-                            context += f"    Note: {col_ann.get('content', '')}\n"
+                            context += f"    Additional Notes: {col_ann.get('content', '')}\n"
             
             context += "\n"
         
@@ -540,4 +755,202 @@ class KnowledgeGraphRAG:
         if results and results[0].get("content"):
             return results[0]["content"]
         return None
+    
+    def add_query_example(
+        self,
+        entity_type: str,
+        entity_name: str,
+        query: str,
+        description: str = "",
+        table_name: Optional[str] = None,
+        database_name: Optional[str] = None
+    ):
+        """
+        Add a query example to a node's description.
+        
+        Args:
+            entity_type: Type of entity ('table', 'column', 'database')
+            entity_name: Name of the entity
+            query: SQL query example
+            description: Optional description of the query
+            table_name: Table name (required for columns)
+            database_name: Database name
+        """
+        logger.info(f"Adding query example for {entity_type}: {entity_name}")
+        
+        # Build query example text
+        example_text = f"Query Example: {query}"
+        if description:
+            example_text = f"{description}\n\n{example_text}"
+        
+        # Get current description
+        current_desc = self._get_node_description(entity_type, entity_name, table_name, database_name)
+        
+        # Append new example
+        if current_desc:
+            new_desc = f"{current_desc}\n\n{example_text}"
+        else:
+            new_desc = example_text
+        
+        # Update node description
+        self._update_node_description(entity_type, entity_name, new_desc, table_name, database_name)
+        
+        logger.debug(f"Query example added to {entity_type}: {entity_name}")
+    
+    def _get_node_description(self, entity_type: str, entity_name: str, table_name: Optional[str], database_name: Optional[str]) -> str:
+        """Get current description from node."""
+        params = {"entity_name": entity_name, "db_name": database_name}
+        
+        if entity_type == "database":
+            query = "MATCH (e:Database {name: $db_name}) RETURN e.description as description"
+        elif entity_type == "column":
+            query = """
+            MATCH (e:Column {name: $entity_name, table_name: $table_name, database_name: $db_name})
+            RETURN e.description as description
+            """
+            params["table_name"] = table_name
+        else:  # table
+            query = """
+            MATCH (e:Table {name: $entity_name, database_name: $db_name})
+            RETURN e.description as description
+            """
+        
+        results = self.neo4j.execute_query(query, params)
+        if results and results[0].get("description"):
+            return results[0]["description"]
+        return ""
+    
+    def _update_node_description(self, entity_type: str, entity_name: str, description: str, table_name: Optional[str], database_name: Optional[str]):
+        """Update node description property."""
+        params = {"entity_name": entity_name, "db_name": database_name, "description": description}
+        
+        if entity_type == "database":
+            query = """
+            MATCH (e:Database {name: $db_name})
+            SET e.description = $description
+            RETURN e
+            """
+        elif entity_type == "column":
+            query = """
+            MATCH (e:Column {name: $entity_name, table_name: $table_name, database_name: $db_name})
+            SET e.description = $description
+            RETURN e
+            """
+            params["table_name"] = table_name
+        else:  # table
+            query = """
+            MATCH (e:Table {name: $entity_name, database_name: $db_name})
+            SET e.description = $description
+            RETURN e
+            """
+        
+        self.neo4j.execute_query(query, params)
+    
+    def get_database_summary(self, database_name: Optional[str] = None) -> str:
+        """
+        Get a summary of all tables and columns in the database.
+        
+        Args:
+            database_name: Database name (optional, uses first available if not provided)
+        
+        Returns:
+            Formatted summary string
+        """
+        logger.info(f"Generating database summary for: {database_name}")
+        
+        # Get all tables with their columns
+        query = """
+        MATCH (db:Database)
+        WHERE $db_name IS NULL OR db.name = $db_name
+        WITH db
+        LIMIT 1
+        MATCH (db)-[:HAS_TABLE]->(t:Table)
+        OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
+        OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
+        WITH db, t, COLLECT(DISTINCT c) as columns, COLLECT(DISTINCT ann.content) as table_descriptions
+        ORDER BY t.name
+        RETURN db.name as db_name, t.name as table_name, 
+               columns, table_descriptions
+        """
+        
+        results = self.neo4j.execute_query(query, {"db_name": database_name})
+        
+        if not results:
+            return "No database schema found in knowledge graph."
+        
+        summary_parts = []
+        db_name = results[0].get("db_name", "Unknown")
+        summary_parts.append(f"# Database Summary: {db_name}\n")
+        
+        for record in results:
+            table_name = record.get("table_name")
+            columns = record.get("columns", [])
+            descriptions = record.get("table_descriptions", [])
+            
+            summary_parts.append(f"\n## Table: {table_name}")
+            
+            if descriptions:
+                summary_parts.append(f"Description: {descriptions[0]}")
+            
+            summary_parts.append(f"\nColumns ({len(columns)}):")
+            for col in columns:
+                col_name = col.get("name", "")
+                col_type = col.get("type", "")
+                col_desc = col.get("description", "")
+                nullable = col.get("nullable", True)
+                null_str = "NULL" if nullable else "NOT NULL"
+                
+                col_line = f"  - {col_name}: {col_type} ({null_str})"
+                if col_desc:
+                    col_line += f" - {col_desc}"
+                summary_parts.append(col_line)
+        
+        return "\n".join(summary_parts)
+    
+    def find_entities_without_descriptions(self, database_name: Optional[str] = None) -> Dict[str, List[Dict]]:
+        """
+        Find tables and columns that don't have descriptions.
+        
+        Args:
+            database_name: Database name (optional)
+        
+        Returns:
+            Dictionary with 'tables' and 'columns' lists
+        """
+        logger.info("Finding entities without descriptions")
+        
+        # Find tables without descriptions
+        table_query = """
+        MATCH (db:Database)
+        WHERE $db_name IS NULL OR db.name = $db_name
+        WITH db LIMIT 1
+        MATCH (db)-[:HAS_TABLE]->(t:Table)
+        WHERE t.description IS NULL OR t.description = ""
+        OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
+        WHERE ann IS NULL
+        RETURN t.name as table_name, t.database_name as db_name
+        ORDER BY t.name
+        """
+        
+        # Find columns without descriptions
+        column_query = """
+        MATCH (db:Database)
+        WHERE $db_name IS NULL OR db.name = $db_name
+        WITH db LIMIT 1
+        MATCH (db)-[:HAS_TABLE]->(t:Table)-[:HAS_COLUMN]->(c:Column)
+        WHERE c.description IS NULL OR c.description = ""
+        OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
+        WHERE ann IS NULL
+        RETURN t.name as table_name, c.name as column_name, c.type as column_type,
+               c.database_name as db_name
+        ORDER BY t.name, c.name
+        """
+        
+        tables = self.neo4j.execute_query(table_query, {"db_name": database_name})
+        columns = self.neo4j.execute_query(column_query, {"db_name": database_name})
+        
+        return {
+            "tables": tables,
+            "columns": columns
+        }
 

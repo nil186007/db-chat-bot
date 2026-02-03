@@ -22,7 +22,12 @@ INSERT INTO products (product_name, description, category, price, stock_quantity
 ('Desk Lamp LED', 'Adjustable LED desk lamp with USB port', 'Home & Kitchen', 44.99, 160),
 ('Throw Pillow Set', 'Set of 4 decorative throw pillows', 'Home & Kitchen', 39.99, 200),
 ('Puzzle 1000 Pieces', 'Jigsaw puzzle with beautiful landscape image', 'Toys & Games', 19.99, 300),
-('Board Game Strategy', 'Popular strategy board game for 2-4 players', 'Toys & Games', 49.99, 100);
+('Board Game Strategy', 'Popular strategy board game for 2-4 players', 'Toys & Games', 49.99, 100),
+('Out of Stock Product A', 'Test product with zero stock', 'Electronics', 99.99, 0),
+('Out of Stock Product B', 'Another test product with zero stock', 'Home & Kitchen', 49.99, 0),
+('Unordered Product X', 'Product that will never be ordered', 'Electronics', 199.99, 50),
+('Unordered Product Y', 'Another product that will never be ordered', 'Sports & Outdoors', 79.99, 75),
+('Unordered Product Z', 'Third product that will never be ordered', 'Accessories', 29.99, 100);
 
 -- Insert Customers
 INSERT INTO customers (first_name, last_name, email, phone, address, city, state, country, zip_code) VALUES
@@ -45,7 +50,10 @@ INSERT INTO customers (first_name, last_name, email, phone, address, city, state
 ('Matthew', 'Robinson', 'matt.r@email.com', '555-0117', '147 Strawberry Way', 'Indianapolis', 'IN', 'USA', '46201'),
 ('Nicole', 'Clark', 'nicole.c@email.com', '555-0118', '258 Blueberry St', 'Seattle', 'WA', 'USA', '98101'),
 ('Andrew', 'Rodriguez', 'andrew.r@email.com', '555-0119', '369 Raspberry Ave', 'Denver', 'CO', 'USA', '80201'),
-('Stephanie', 'Lewis', 'stephanie.l@email.com', '555-0120', '741 Blackberry Blvd', 'Washington', 'DC', 'USA', '20001');
+('Stephanie', 'Lewis', 'stephanie.l@email.com', '555-0120', '741 Blackberry Blvd', 'Washington', 'DC', 'USA', '20001'),
+('Gmail User One', 'Test', 'gmail.user1@gmail.com', '555-0201', '100 Test St', 'New York', 'NY', 'USA', '10001'),
+('Gmail User Two', 'Test', 'gmail.user2@gmail.com', '555-0202', '200 Test Ave', 'Los Angeles', 'CA', 'USA', '90001'),
+('Gmail User Three', 'Test', 'gmail.user3@gmail.com', '555-0203', '300 Test Rd', 'Chicago', 'IL', 'USA', '60601');
 
 -- Insert Orders
 INSERT INTO orders (customer_id, order_date, status, shipping_address, notes) VALUES
@@ -129,5 +137,17 @@ INSERT INTO reviews (product_id, customer_id, rating, review_text) VALUES
 ((SELECT product_id FROM products WHERE product_name = 'Stand Mixer'),
  (SELECT customer_id FROM customers WHERE email = 'robert.a@email.com'), 5, 'Perfect for baking! Powerful and easy to use.'),
 ((SELECT product_id FROM products WHERE product_name = 'Water Bottle Insulated'),
- (SELECT customer_id FROM customers WHERE email = 'amanda.t@email.com'), 5, 'Keeps drinks cold all day. Very durable and well-designed.');
+ (SELECT customer_id FROM customers WHERE email = 'amanda.t@email.com'), 5, 'Keeps drinks cold all day. Very durable and well-designed.'),
+((SELECT product_id FROM products WHERE product_name = 'Laptop Pro 15"'),
+ (SELECT customer_id FROM customers WHERE email = 'sarah.j@email.com'), 5, 'Amazing laptop, highly recommend!'),
+((SELECT product_id FROM products WHERE product_name = 'Monitor 27" 4K'),
+ (SELECT customer_id FROM customers WHERE email = 'michael.brown@email.com'), 5, 'Best monitor I have ever used!'),
+((SELECT product_id FROM products WHERE product_name = 'Bluetooth Headphones'),
+ (SELECT customer_id FROM customers WHERE email = 'emily.davis@email.com'), 5, 'Outstanding sound quality!'),
+((SELECT product_id FROM products WHERE product_name = 'Smart Watch'),
+ (SELECT customer_id FROM customers WHERE email = 'david.w@email.com'), 5, 'Great fitness tracking features!'),
+((SELECT product_id FROM products WHERE product_name = 'Mechanical Keyboard'),
+ (SELECT customer_id FROM customers WHERE email = 'jessica.m@email.com'), 5, 'Perfect for gaming and typing!'),
+((SELECT product_id FROM products WHERE product_name = 'Stand Mixer'),
+ (SELECT customer_id FROM customers WHERE email = 'amanda.t@email.com'), 5, 'Makes baking so much easier!');
 
