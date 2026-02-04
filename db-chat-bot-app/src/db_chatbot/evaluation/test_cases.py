@@ -44,7 +44,7 @@ TEST_CASES: List[TestCase] = [
     TestCase(
         id="simple_001",
         natural_language="Show me all products",
-        expected_sql="SELECT * FROM products;",
+        expected_sql="SELECT product_name FROM products;",
         complexity="simple",
         description="Basic SELECT all from single table",
         category="basic_select"

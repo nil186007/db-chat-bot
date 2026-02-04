@@ -22,7 +22,7 @@ This directory contains all Docker-related files for setting up:
 3. **Connect to the database:**
    - Host: `localhost`
    - Port: `5432`
-   - Database: `ecommerce_db`
+   - Database: `customer_orders_and_reviews_db`
    - Username: `postgres`
    - Password: `postgres`
 
@@ -45,7 +45,7 @@ docker-setup/
 ### PostgreSQL Database
 - **Container:** `db-chat-bot-postgres`
 - **Port:** `5432`
-- **Database:** `ecommerce_db`
+- **Database:** `customer_orders_and_reviews_db` (PostgreSQL) or `vendor_supply_chain_db` (MongoDB)
 - **Auto-initialization:** Schema and data are automatically loaded on first start
 
 ### pgAdmin (Web Client)
@@ -65,7 +65,7 @@ docker-setup/
 ### MongoDB (Supply Chain & Inventory)
 - **Container:** `db-chat-bot-mongodb`
 - **Port:** `27017`
-- **Database:** `ecommerce_db`
+- **Database:** `customer_orders_and_reviews_db` (PostgreSQL) or `vendor_supply_chain_db` (MongoDB)
 - **Username:** `admin`
 - **Password:** `adminpassword`
 - **Purpose:** Stores supply chain and inventory data related to products
@@ -189,7 +189,7 @@ cd docker-setup/scripts
 
 #### Option 2: Using the JavaScript file directly
 ```bash
-docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin ecommerce_db < scripts/load_mongodb_data.js
+docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin vendor_supply_chain_db < scripts/load_mongodb_data.js
 ```
 
 #### Option 3: Using the Python script

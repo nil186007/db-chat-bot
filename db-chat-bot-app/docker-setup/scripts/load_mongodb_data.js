@@ -2,13 +2,13 @@
 // This script creates collections and loads supply chain data related to products in PostgreSQL
 // This script is automatically executed by MongoDB on first initialization (docker-entrypoint-initdb.d)
 
-// Use the database specified by MONGO_INITDB_DATABASE (ecommerce_db)
+// Use the database specified by MONGO_INITDB_DATABASE (vendor_supply_chain_db)
 // During initialization, scripts run in the context of the init database
-// Switch to ecommerce_db (or use current if already set)
+// Switch to vendor_supply_chain_db (or use current if already set)
 try {
-    db = db.getSiblingDB('ecommerce_db');
+    db = db.getSiblingDB('vendor_supply_chain_db');
 } catch (e) {
-    // If already in ecommerce_db or error, continue
+    // If already in vendor_supply_chain_db or error, continue
     print("Using current database context");
 }
 

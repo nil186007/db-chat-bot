@@ -42,8 +42,8 @@ def main():
     parser.add_argument(
         "--database",
         type=str,
-        default="ecommerce_db",
-        help="Database name (default: ecommerce_db)"
+        default="customer_orders_and_reviews_db",
+        help="Database name (default: customer_orders_and_reviews_db)"
     )
     parser.add_argument(
         "--user",

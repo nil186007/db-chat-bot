@@ -59,7 +59,7 @@ python run_evaluation.py
 python run_evaluation.py \
     --host localhost \
     --port 5432 \
-    --database ecommerce_db \
+    --database customer_orders_and_reviews_db \
     --user postgres \
     --password postgres
 ```
@@ -115,7 +115,7 @@ python run_evaluation.py --output-dir my_evaluation_results
 ```
 --host HOST              PostgreSQL host (default: localhost)
 --port PORT              PostgreSQL port (default: 5432)
---database DATABASE      Database name (default: ecommerce_db)
+--database DATABASE      Database name (default: customer_orders_and_reviews_db)
 --user USER              Database user (default: postgres)
 --password PASSWORD      Database password (default: postgres)
 --complexity {simple,medium,complex,very_complex}

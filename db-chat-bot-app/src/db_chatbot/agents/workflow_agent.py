@@ -177,6 +177,10 @@ class WorkflowAgent:
         retry_count = state.get("retry_count", 0)
         step_num = 3 + (retry_count * 2)
         
+        logger.info("WORKFLOW AGENT: SQL Generation")
+        logger.info(f"  User Query: {state['user_query']}")
+        logger.info(f"  Retry Count: {retry_count}")
+        
         if retry_count > 0:
             self._log_step(state, step_num, f"SQL Generation (Retry {retry_count})", "in_progress", 
                           "Regenerating SQL query...")
@@ -186,11 +190,14 @@ class WorkflowAgent:
         
         # Extract keywords from query for enhanced context retrieval
         query_keywords = state["user_query"].lower().split()
+        logger.info(f"  Extracted Keywords: {query_keywords}")
         
         # Use RAG's enhanced context retrieval (includes annotations from knowledge graph)
+        logger.info("  Retrieving schema context from RAG...")
         schema_context = self.schema_rag.format_schema_for_context(
             query_keywords=query_keywords
         )
+        logger.info(f"  Schema Context Length: {len(schema_context)} characters")
         
         # For backward compatibility, still pass schema_info but use enhanced context in prompt
         sql_query = self.sql_generator.generate_sql(
@@ -201,12 +208,14 @@ class WorkflowAgent:
         )
         
         if not sql_query:
+            logger.error("  SQL Generation FAILED: No query generated")
             self._log_step(state, step_num, "SQL Generation", "error", 
                           "Failed to generate SQL query")
             state["final_response"] = "I couldn't generate a SQL query for your question. Please try rephrasing it."
             return state
         
         state["sql_query"] = sql_query
+        logger.info(f"  Generated SQL Query: {sql_query}")
         retry_label = f" (Retry {retry_count})" if retry_count > 0 else ""
         self._log_step(state, step_num, f"SQL Generation{retry_label}", "completed", 
                       f"Generated SQL query: {sql_query[:60]}...", sql_query=sql_query)
@@ -255,20 +264,29 @@ class WorkflowAgent:
         retry_count = state.get("retry_count", 0)
         step_num = 3 + (retry_count * 2) + 2
         
+        logger.info("WORKFLOW AGENT: Query Execution")
+        sql_query = state.get("sql_query")
+        logger.info(f"  Executing SQL Query: {sql_query}")
+        
         self._log_step(state, step_num, "Query Execution (DB Client Tool)", "in_progress", 
                       "Executing SQL query...")
         
-        sql_query = state.get("sql_query")
         success, results, error = self.db_client.execute_query(sql_query)
         
         if success and results and "columns" in results:
             row_count = len(results.get("rows", []))
+            columns = results.get("columns", [])
+            logger.info(f"  Query Execution SUCCESS: {row_count} rows, {len(columns)} columns")
+            logger.info(f"  Columns: {columns}")
+            if row_count > 0:
+                logger.debug(f"  First row sample: {results.get('rows', [])[0]}")
             self._log_step(state, step_num, "Query Execution (DB Client Tool)", "completed", 
                           f"Query executed successfully. Returned {row_count} row(s)")
             state["query_results"] = results
             state["execution_error"] = None
             return state
         else:
+            logger.error(f"  Query Execution FAILED: {error}")
             self._log_step(state, step_num, "Query Execution (DB Client Tool)", "error", 
                           f"Execution failed: {error}", 
                           sql_query=sql_query, error=error)
@@ -304,6 +322,11 @@ class WorkflowAgent:
         error = state.get("execution_error") or state.get("validation_error")
         user_query = state["user_query"]
         
+        logger.info("WORKFLOW AGENT: Query Fix")
+        logger.info(f"  Attempt: {retry_count + 1}/{self.max_retries}")
+        logger.info(f"  Failed Query: {failed_query}")
+        logger.info(f"  Error: {error}")
+        
         # Log the failed query first
         self._log_step(state, step_num, f"Query Fix (Attempt {retry_count + 1}/{self.max_retries})", 
                       "in_progress", f"Attempting to fix SQL query. Previous error: {error[:100] if error else 'Unknown error'}...",
@@ -328,6 +351,8 @@ class WorkflowAgent:
         retry_count = state.get("retry_count", 0)
         step_num = 3 + (retry_count * 2) + 3
         
+        logger.info("WORKFLOW AGENT: Response Generation")
+        
         self._log_step(state, step_num, "Response Generation", "in_progress", 
                       "Generating natural language response...")
         
@@ -336,6 +361,7 @@ class WorkflowAgent:
             df = pd.DataFrame(results["rows"], columns=results["columns"])
             state["df"] = df
             row_count = len(df)
+            logger.info(f"  Processing {row_count} rows for response generation")
             
             if self.response_generator:
                 try:

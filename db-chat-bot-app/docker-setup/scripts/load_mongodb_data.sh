@@ -12,7 +12,7 @@ if ! docker ps | grep -q db-chat-bot-mongodb; then
 fi
 
 # Load the data
-docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin ecommerce_db < load_mongodb_data.js
+docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin vendor_supply_chain_db < load_mongodb_data.js
 
 if [ $? -eq 0 ]; then
     echo "✅ MongoDB data loaded successfully!"

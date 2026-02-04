@@ -23,10 +23,13 @@ from db_chatbot.rag.schema_rag import SchemaRAG
 from db_chatbot.rag.knowledge_graph_rag import KnowledgeGraphRAG
 from db_chatbot.handlers.annotation_handler import AnnotationHandler
 from db_chatbot.handlers.query_example_handler import QueryExampleHandler
+from db_chatbot.handlers.database_type_handler import DatabaseTypeHandler
+from db_chatbot.handlers.schema_query_handler import SchemaQueryHandler
 from db_chatbot.agents.workflow_agent import WorkflowAgent
 from db_chatbot.agents.mongodb_workflow_agent import MongoDBWorkflowAgent
 from db_chatbot.agents.orchestrator_agent import OrchestratorAgent
 from db_chatbot.query_intent.database_router import DatabaseRouter
+from db_chatbot.query_intent.unified_intent_classifier import UnifiedIntentClassifier
 from db_chatbot.config.settings import get_logger
 
 logger = get_logger(__name__)
@@ -52,8 +55,12 @@ if "db_client" not in st.session_state:
     st.session_state.sql_generator = None
     st.session_state.mongodb_query_generator = None
     st.session_state.messages = []
-    st.session_state.annotation_handler = AnnotationHandler()
+    # Initialize handlers without model initially (will be updated when model loads)
+    st.session_state.annotation_handler = AnnotationHandler(model_name=None)
     st.session_state.query_example_handler = QueryExampleHandler()
+    st.session_state.database_type_handler = DatabaseTypeHandler()
+    st.session_state.schema_query_handler = SchemaQueryHandler(model_name=None)
+    st.session_state.unified_intent_classifier = None  # Will be initialized when model loads
     # Initialize SchemaRAG without KnowledgeGraphRAG initially
     st.session_state.schema_rag = SchemaRAG()
     # PostgreSQL connection info
@@ -156,7 +163,7 @@ def main():
             with st.form("postgres_connection_form"):
                 pg_host = st.text_input("Host", value="localhost", key="pg_host")
                 pg_port = st.number_input("Port", value=5432, min_value=1, max_value=65535, key="pg_port")
-                pg_name = st.text_input("Database", value="ecommerce_db", key="pg_db")
+                pg_name = st.text_input("Database", value="customer_orders_and_reviews_db", key="pg_db")
                 pg_user = st.text_input("Username", value="postgres", key="pg_user")
                 pg_password = st.text_input("Password", type="password", key="pg_password")
                 
@@ -222,7 +229,7 @@ def main():
             with st.form("mongodb_connection_form"):
                 mongo_host = st.text_input("Host", value="localhost", key="mongo_host")
                 mongo_port = st.number_input("Port", value=27017, min_value=1, max_value=65535, key="mongo_port")
-                mongo_db = st.text_input("Database", value="ecommerce_db", key="mongo_db")
+                mongo_db = st.text_input("Database", value="vendor_supply_chain_db", key="mongo_db")
                 mongo_user = st.text_input("Username (optional)", value="", key="mongo_user")
                 mongo_password = st.text_input("Password (optional)", type="password", value="", key="mongo_password")
                 
@@ -311,10 +318,22 @@ def main():
                 st.session_state.mongodb_query_generator = MongoDBQueryGenerator(model_name=selected_model)
                 # Initialize response generator with the same model
                 st.session_state.response_generator = ResponseGenerator(model_name=selected_model)
-                # Initialize query classifier with the same model
+                # Initialize unified intent classifier (most important component)
+                st.session_state.unified_intent_classifier = UnifiedIntentClassifier(model_name=selected_model)
+                # Initialize query classifier with the same model (for backward compatibility)
                 st.session_state.query_classifier = QueryClassifier(model_name=selected_model)
-                # Initialize database router
-                st.session_state.database_router = DatabaseRouter(model_name=selected_model)
+                # Initialize database router with knowledge graph RAG if available
+                kg_rag = None
+                if st.session_state.schema_rag and st.session_state.schema_rag.knowledge_graph_rag:
+                    kg_rag = st.session_state.schema_rag.knowledge_graph_rag
+                st.session_state.database_router = DatabaseRouter(
+                    model_name=selected_model,
+                    knowledge_graph_rag=kg_rag
+                )
+                # Update annotation handler with model for LLM-based parsing (fallback)
+                st.session_state.annotation_handler = AnnotationHandler(model_name=selected_model)
+                # Update schema query handler with model for LLM-based parsing (fallback)
+                st.session_state.schema_query_handler = SchemaQueryHandler(model_name=selected_model)
                 # Reset workflow agents and orchestrator - will be initialized when needed
                 st.session_state.workflow_agent = None
                 st.session_state.mongodb_workflow_agent = None
@@ -331,171 +350,18 @@ def main():
         elif st.session_state.mongodb_query_generator:
             st.info(f"📌 Current model: {st.session_state.mongodb_query_generator.model_name}")
         
-        # Metadata Management Section
-        if (st.session_state.schema_loaded or st.session_state.mongodb_schema_loaded) and st.session_state.neo4j_connected:
-            st.divider()
-            st.subheader("📝 Metadata Management")
-            st.caption("Manage descriptions for database, tables, and columns. These descriptions enhance query generation context.")
-            
-            # Database Description - handle both PostgreSQL and MongoDB
-            with st.expander("🗄️ Database Description", expanded=False):
-                db_options = []
-                if st.session_state.connected and st.session_state.postgres_db_name:
-                    db_options.append(("PostgreSQL", st.session_state.postgres_db_name))
-                if st.session_state.mongodb_connected and st.session_state.mongodb_db_name:
-                    db_options.append(("MongoDB", st.session_state.mongodb_db_name))
-                
-                if db_options:
-                    selected_db_type, selected_db_name = st.selectbox(
-                        "Select Database",
-                        options=db_options,
-                        format_func=lambda x: f"{x[0]}: {x[1]}",
-                        key="metadata_db_select"
-                    )
-                    
-                    current_db_desc = st.session_state.schema_rag.get_annotation(
-                        "database",
-                        selected_db_name
-                    ) if st.session_state.schema_rag else "" or ""
-                    
-                    db_description = st.text_area(
-                        f"Description for {selected_db_type} database '{selected_db_name}'",
-                        value=current_db_desc,
-                        height=100,
-                        key="db_description",
-                        help="Describe what this database stores and its purpose"
-                    )
-                    if st.button("💾 Save Database Description", key="save_db_desc", use_container_width=True):
-                        if st.session_state.schema_rag:
-                            st.session_state.schema_rag.add_annotation(
-                                entity_type="database",
-                                entity_name=selected_db_name,
-                                content=db_description,
-                                table_name=None
-                            )
-                            st.success(f"✅ Database description saved for {selected_db_type}!")
-                            st.rerun()
-                else:
-                    st.info("No databases connected for metadata management.")
-            
-            # Table Descriptions (PostgreSQL only)
-            schema_info = st.session_state.schema_rag.get_schema() if st.session_state.schema_rag else None
-            if schema_info and schema_info.get("tables"):
-                
-                # Table Descriptions
-                with st.expander("📋 Table Descriptions", expanded=False):
-                    table_options = [t["name"] for t in schema_info["tables"]]
-                    selected_table = st.selectbox(
-                        "Select Table",
-                        options=table_options,
-                        key="metadata_table_select"
-                    )
-                    
-                    if selected_table:
-                        # Get current annotation for selected table
-                        current_table_desc = st.session_state.schema_rag.get_annotation(
-                            "table",
-                            selected_table
-                        ) or ""
-                        
-                        table_description = st.text_area(
-                            f"Description for '{selected_table}' table",
-                            value=current_table_desc,
-                            height=150,
-                            key=f"table_desc_{selected_table}",
-                            help="Describe what this table stores, its purpose, and key information"
-                        )
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("💾 Save Table Description", key=f"save_table_{selected_table}", use_container_width=True):
-                                st.session_state.schema_rag.add_annotation(
-                                    entity_type="table",
-                                    entity_name=selected_table,
-                                    content=table_description,
-                                    table_name=None
-                                )
-                                st.success(f"✅ Description saved for table '{selected_table}'!")
-                                st.rerun()
-                        with col2:
-                            if st.button("🔄 View Columns", key=f"view_cols_{selected_table}", use_container_width=True):
-                                st.session_state[f"show_cols_{selected_table}"] = not st.session_state.get(f"show_cols_{selected_table}", False)
-                        
-                        # Show columns for selected table
-                        if st.session_state.get(f"show_cols_{selected_table}", False):
-                            selected_table_info = next((t for t in schema_info["tables"] if t["name"] == selected_table), None)
-                            if selected_table_info:
-                                st.markdown("**Columns:**")
-                                for col in selected_table_info["columns"]:
-                                    col_name = col["name"]
-                                    # Get current column annotation
-                                    current_col_desc = st.session_state.schema_rag.get_annotation(
-                                        "column",
-                                        col_name,
-                                        table_name=selected_table
-                                    ) or ""
-                                    
-                                    with st.expander(f"📌 {col_name} ({col['type']})", expanded=False):
-                                        col_description = st.text_area(
-                                            f"Description for column '{col_name}'",
-                                            value=current_col_desc,
-                                            height=100,
-                                            key=f"col_desc_{selected_table}_{col_name}",
-                                            help=f"Describe what this column stores (type: {col['type']})"
-                                        )
-                                        if st.button("💾 Save", key=f"save_col_{selected_table}_{col_name}", use_container_width=True):
-                                            st.session_state.schema_rag.add_annotation(
-                                                entity_type="column",
-                                                entity_name=col_name,
-                                                content=col_description,
-                                                table_name=selected_table
-                                            )
-                                            st.success(f"✅ Description saved for column '{col_name}'!")
-                                            st.rerun()
-        elif st.session_state.schema_loaded and not st.session_state.neo4j_connected:
-            st.divider()
-            st.info("💡 Connect to Neo4j to enable metadata management features")
-        
-        # Show schema info for all connected databases
+        # Info about metadata management via chat
         st.divider()
-        st.subheader("📊 Database Schema")
-        
-        # PostgreSQL Tables
-        if st.session_state.connected and st.session_state.schema_loaded:
-            schema_info = st.session_state.schema_rag.get_schema()
-            if schema_info and schema_info.get("tables"):
-                with st.expander(f"🐘 PostgreSQL: {st.session_state.postgres_db_name} ({len(schema_info['tables'])} table(s))", expanded=True):
-                    for table in schema_info["tables"]:
-                        col_count = len(table.get("columns", []))
-                        st.markdown(f"**📋 {table['name']}** ({col_count} column(s))")
-                        with st.expander(f"View columns in {table['name']}", expanded=False):
-                            for col in table.get("columns", []):
-                                nullable = " (nullable)" if col.get("nullable") else ""
-                                st.text(f"  • {col['name']}: {col['type']}{nullable}")
-        
-        # MongoDB Collections
-        if st.session_state.mongodb_connected and st.session_state.mongodb_schema_loaded:
-            try:
-                mongodb_schema = st.session_state.mongodb_client.fetch_schema()
-                if mongodb_schema and mongodb_schema.get("collections"):
-                    with st.expander(f"🍃 MongoDB: {st.session_state.mongodb_db_name} ({len(mongodb_schema['collections'])} collection(s))", expanded=True):
-                        for collection in mongodb_schema["collections"]:
-                            doc_count = collection.get("document_count", 0)
-                            field_count = len(collection.get("fields", []))
-                            st.markdown(f"**📦 {collection['name']}** ({doc_count} document(s), {field_count} field(s))")
-                            with st.expander(f"View fields in {collection['name']}", expanded=False):
-                                for field in collection.get("fields", []):
-                                    types_str = ", ".join(field.get("types", []))
-                                    nullable = " (nullable)" if field.get("nullable") else ""
-                                    example = f" (example: {field.get('example')})" if field.get("example") else ""
-                                    st.text(f"  • {field['name']}: {types_str}{nullable}{example}")
-            except Exception as e:
-                logger.error(f"Error fetching MongoDB schema for display: {e}")
-                st.warning(f"Could not load MongoDB schema: {str(e)}")
-        
-        # Show message if no databases connected
-        if not st.session_state.connected and not st.session_state.mongodb_connected:
-            st.info("👈 Connect to a database to see schema information here.")
+        st.info("💡 **Tip:** Provide metadata by chatting with the bot:\n\n"
+                "**Database descriptions:**\n"
+                "- 'PostgreSQL stores: products, orders, customers, sales data'\n"
+                "- 'MongoDB contains: vendors, inventory, shipments, purchase orders'\n\n"
+                "**Table/Collection descriptions:**\n"
+                "- 'The products table contains: product information, pricing, inventory levels'\n"
+                "- 'The vendors collection stores: supplier details, contact information'\n\n"
+                "**Column/Field descriptions:**\n"
+                "- 'The product_id column is: unique identifier for each product'\n"
+                "- 'The vendor_name field contains: name of the supplier or vendor'")
     
     # Main chat interface
     if not st.session_state.connected and not st.session_state.mongodb_connected:
@@ -574,6 +440,10 @@ def main():
     
     # Chat input
     if prompt := st.chat_input("Ask a question about your database..."):
+        logger.info("=" * 80)
+        logger.info("FRONTEND: User query received")
+        logger.info(f"USER QUERY: {prompt}")
+        logger.info("=" * 80)
         logger.info(f"User query received: {prompt[:50]}...")
         # Add user message to chat
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -581,8 +451,449 @@ def main():
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            # Check for DB summary request
-            if any(keyword in prompt.lower() for keyword in ["database summary", "db summary", "show database", "list tables", "database details", "schema summary"]):
+            # Use unified intent classifier if available (most important step)
+            if st.session_state.unified_intent_classifier:
+                logger.info("Using unified intent classifier")
+                classification = st.session_state.unified_intent_classifier.classify_intent(prompt)
+                intent = classification.get("intent")
+                details = classification.get("details", {})
+                confidence = classification.get("confidence", 0.0)
+                
+                logger.info(f"Intent classified: {intent} (confidence: {confidence:.2f})")
+                logger.debug(f"Classification details: {details}")
+                
+                # Route based on intent
+                if intent == "SCHEMA_QUERY":
+                    logger.info("Routing to SCHEMA_QUERY handler")
+                    # Handle schema query from RAG
+                    if st.session_state.schema_rag.knowledge_graph_rag:
+                        try:
+                            response_parts = []
+                            kg_rag = st.session_state.schema_rag.knowledge_graph_rag
+                            query_type = details.get("query_type")
+                            
+                            if query_type == "databases":
+                                databases = kg_rag.get_all_databases()
+                                if databases:
+                                    response_parts.append("## 📊 Connected Databases\n\n")
+                                    for db in databases:
+                                        db_type_icon = "🐘" if db["type"] == "postgresql" else "🍃" if db["type"] == "mongodb" else "💾"
+                                        response_parts.append(f"### {db_type_icon} {db['name']} ({db['type'].upper()})")
+                                        response_parts.append(f"- **Host:** {db.get('host', 'N/A')}")
+                                        response_parts.append(f"- **Port:** {db.get('port', 'N/A')}")
+                                        if db.get("description"):
+                                            response_parts.append(f"- **Description:** {db['description']}")
+                                        response_parts.append("")
+                                else:
+                                    response_parts.append("No databases found in knowledge graph.")
+                            
+                            elif query_type == "tables":
+                                database_name = details.get("database_name")
+                                if not database_name:
+                                    databases = [db for db in kg_rag.get_all_databases() if db["type"] == "postgresql"]
+                                    if databases:
+                                        for db in databases:
+                                            tables = kg_rag.get_tables_for_database(db["name"])
+                                            if tables:
+                                                response_parts.append(f"## 📋 Tables in {db['name']} (PostgreSQL)\n\n")
+                                                for table in tables:
+                                                    response_parts.append(f"### {table['name']}")
+                                                    response_parts.append(f"- **Columns:** {table['column_count']}")
+                                                    if table.get("description"):
+                                                        response_parts.append(f"- **Description:** {table['description']}")
+                                                    response_parts.append("")
+                                else:
+                                    tables = kg_rag.get_tables_for_database(database_name)
+                                    if tables:
+                                        response_parts.append(f"## 📋 Tables in {database_name}\n\n")
+                                        for table in tables:
+                                            response_parts.append(f"### {table['name']}")
+                                            response_parts.append(f"- **Columns:** {table['column_count']}")
+                                            if table.get("description"):
+                                                response_parts.append(f"- **Description:** {table['description']}")
+                                            response_parts.append("")
+                            
+                            elif query_type == "columns":
+                                table_name = details.get("table_name")
+                                database_name = details.get("database_name") or st.session_state.postgres_db_name
+                                if table_name and database_name:
+                                    columns = kg_rag.get_columns_for_table(table_name, database_name)
+                                    if columns:
+                                        response_parts.append(f"## 📊 Columns in {table_name} table\n\n")
+                                        for col in columns:
+                                            nullable_str = " (nullable)" if col.get("nullable") else " (not null)"
+                                            response_parts.append(f"### {col['name']}")
+                                            response_parts.append(f"- **Type:** {col.get('type', 'N/A')}{nullable_str}")
+                                            if col.get("description"):
+                                                response_parts.append(f"- **Description:** {col['description']}")
+                                            response_parts.append("")
+                            
+                            elif query_type == "collections":
+                                database_name = details.get("database_name")
+                                if not database_name:
+                                    databases = [db for db in kg_rag.get_all_databases() if db["type"] == "mongodb"]
+                                    if databases:
+                                        for db in databases:
+                                            collections = kg_rag.get_collections_for_database(db["name"])
+                                            if collections:
+                                                response_parts.append(f"## 📦 Collections in {db['name']} (MongoDB)\n\n")
+                                                for coll in collections:
+                                                    response_parts.append(f"### {coll['name']}")
+                                                    response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
+                                                    response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
+                                                    if coll.get("description"):
+                                                        response_parts.append(f"- **Description:** {coll['description']}")
+                                                    response_parts.append("")
+                                else:
+                                    collections = kg_rag.get_collections_for_database(database_name)
+                                    if collections:
+                                        response_parts.append(f"## 📦 Collections in {database_name}\n\n")
+                                        for coll in collections:
+                                            response_parts.append(f"### {coll['name']}")
+                                            response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
+                                            response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
+                                            if coll.get("description"):
+                                                response_parts.append(f"- **Description:** {coll['description']}")
+                                            response_parts.append("")
+                            
+                            elif query_type == "fields":
+                                collection_name = details.get("collection_name")
+                                database_name = details.get("database_name") or st.session_state.mongodb_db_name
+                                if collection_name and database_name:
+                                    fields = kg_rag.get_fields_for_collection(collection_name, database_name)
+                                    if fields:
+                                        response_parts.append(f"## 📊 Fields in {collection_name} collection\n\n")
+                                        for field in fields:
+                                            types_str = ", ".join(field.get("types", [])) if isinstance(field.get("types"), list) else field.get("types", "N/A")
+                                            nullable_str = " (nullable)" if field.get("nullable") else " (not null)"
+                                            response_parts.append(f"### {field['name']}")
+                                            response_parts.append(f"- **Types:** {types_str}{nullable_str}")
+                                            if field.get("example"):
+                                                response_parts.append(f"- **Example:** {field['example']}")
+                                            if field.get("description"):
+                                                response_parts.append(f"- **Description:** {field['description']}")
+                                            response_parts.append("")
+                            
+                            if response_parts:
+                                full_response = "\n".join(response_parts)
+                                st.markdown(full_response)
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": full_response
+                                })
+                            else:
+                                st.warning("Could not retrieve schema information.")
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": "Could not retrieve schema information."
+                                })
+                            st.rerun()
+                        except Exception as e:
+                            logger.error(f"Error handling schema query: {e}")
+                            st.error(f"Error retrieving schema information: {str(e)}")
+                            st.rerun()
+                
+                elif intent == "METADATA_UPDATE":
+                    logger.info("Routing to METADATA_UPDATE handler")
+                    # Handle metadata update
+                    if st.session_state.schema_rag.knowledge_graph_rag:
+                        try:
+                            entity_type = details.get("entity_type")
+                            entity_name = details.get("entity_name")
+                            table_name = details.get("table_name")
+                            content = details.get("content")
+                            
+                            if entity_type and content:
+                                # Handle database type descriptions (e.g., "PostgreSQL stores: ...")
+                                if entity_type == "database" and not entity_name:
+                                    # Check if it's a database type description
+                                    query_lower = prompt.lower()
+                                    if "postgresql" in query_lower or "postgres" in query_lower:
+                                        # Update PostgreSQL database description
+                                        db_type = "postgresql"
+                                        database_name = st.session_state.postgres_db_name
+                                        if database_name:
+                                            st.session_state.schema_rag.knowledge_graph_rag.update_database_type_description(
+                                                db_type=db_type,
+                                                description=content
+                                            )
+                                            response = f"✅ Database description saved for PostgreSQL:\n\n{content}"
+                                        else:
+                                            response = "⚠️ PostgreSQL database not connected. Please connect first."
+                                    elif "mongodb" in query_lower or "mongo" in query_lower:
+                                        # Update MongoDB database description
+                                        db_type = "mongodb"
+                                        database_name = st.session_state.mongodb_db_name
+                                        if database_name:
+                                            st.session_state.schema_rag.knowledge_graph_rag.update_database_type_description(
+                                                db_type=db_type,
+                                                description=content
+                                            )
+                                            response = f"✅ Database description saved for MongoDB:\n\n{content}"
+                                        else:
+                                            response = "⚠️ MongoDB database not connected. Please connect first."
+                                    else:
+                                        response = "⚠️ Could not determine database type. Please specify PostgreSQL or MongoDB."
+                                    
+                                    st.success(response)
+                                    st.session_state.messages.append({
+                                        "role": "assistant",
+                                        "content": response
+                                    })
+                                    st.rerun()
+                                    return
+                                
+                                # Handle regular metadata updates (tables, columns, collections, fields, specific databases)
+                                if entity_name:
+                                    # Determine database name
+                                    database_name = None
+                                    if entity_type in ["table", "column"]:
+                                        database_name = st.session_state.postgres_db_name
+                                    elif entity_type in ["collection", "field"]:
+                                        database_name = st.session_state.mongodb_db_name
+                                    elif entity_type == "database":
+                                        database_name = entity_name if entity_name else (st.session_state.postgres_db_name or st.session_state.mongodb_db_name)
+                                    
+                                    st.session_state.schema_rag.add_annotation(
+                                        entity_type=entity_type,
+                                        entity_name=entity_name,
+                                        content=content,
+                                        table_name=table_name,
+                                        database_name=database_name
+                                    )
+                                    
+                                    entity_desc = f"{entity_type} '{entity_name}'"
+                                    if table_name:
+                                        if entity_type == "column":
+                                            entity_desc = f"column '{entity_name}' in table '{table_name}'"
+                                        elif entity_type == "field":
+                                            entity_desc = f"field '{entity_name}' in collection '{table_name}'"
+                                    
+                                    response = f"✅ Metadata saved for {entity_desc}:\n\n{content}"
+                                    st.success(response)
+                                    st.session_state.messages.append({
+                                        "role": "assistant",
+                                        "content": response
+                                    })
+                                    logger.info(f"Metadata stored: {entity_desc}")
+                                else:
+                                    st.warning("Could not extract entity name from query.")
+                                    st.session_state.messages.append({
+                                        "role": "assistant",
+                                        "content": "Could not extract entity name. Please specify the entity (table, column, collection, field, or database name)."
+                                    })
+                            else:
+                                st.warning("Could not extract metadata information from query.")
+                                st.session_state.messages.append({
+                                    "role": "assistant",
+                                    "content": "Could not extract metadata information. Please try: 'add description to table products that it contains product information'"
+                                })
+                            st.rerun()
+                        except Exception as e:
+                            logger.error(f"Error saving metadata: {e}")
+                            st.error(f"Error saving metadata: {str(e)}")
+                            st.rerun()
+                
+                elif intent == "GENERAL_QUESTION":
+                    logger.info("Routing to GENERAL_QUESTION handler")
+                    # Handle general questions/greetings
+                    greeting_responses = {
+                        "hello": "Hello! 👋 I'm your database assistant. How can I help you query your databases today?",
+                        "hi": "Hi! 👋 I can help you query your PostgreSQL and MongoDB databases, manage metadata, and explore schema information.",
+                        "help": "I can help you:\n- Query data from PostgreSQL and MongoDB\n- Add/update metadata for databases, tables, columns, collections, and fields\n- Explore schema information\n- Show connected databases and their structure\n\nTry asking: 'show all vendors', 'list tables', or 'add description to products table'"
+                    }
+                    
+                    query_lower = prompt.lower().strip()
+                    response = greeting_responses.get(query_lower, 
+                        "Hello! 👋 I'm your database assistant. I can help you:\n"
+                        "- Query data from your databases\n"
+                        "- Manage metadata and descriptions\n"
+                        "- Explore schema information\n\n"
+                        "What would you like to do?")
+                    
+                    st.markdown(response)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response
+                    })
+                    st.rerun()
+                
+                elif intent == "DB_QUERY":
+                    logger.info("Routing to DB_QUERY handler - will proceed to orchestrator")
+                    # Continue to orchestrator for DB query execution
+                    # (fall through to orchestrator code below)
+            
+            # Fallback: Check for schema information queries (if unified classifier not available)
+            elif st.session_state.schema_query_handler.is_schema_query(prompt):
+                logger.info("Detected schema query request")
+                schema_query = st.session_state.schema_query_handler.parse_schema_query(prompt)
+                
+                if schema_query and st.session_state.schema_rag.knowledge_graph_rag:
+                    try:
+                        response_parts = []
+                        kg_rag = st.session_state.schema_rag.knowledge_graph_rag
+                        
+                        if schema_query["query_type"] == "databases":
+                            # Show all databases
+                            databases = kg_rag.get_all_databases()
+                            if databases:
+                                response_parts.append("## 📊 Connected Databases\n\n")
+                                for db in databases:
+                                    db_type_icon = "🐘" if db["type"] == "postgresql" else "🍃" if db["type"] == "mongodb" else "💾"
+                                    response_parts.append(f"### {db_type_icon} {db['name']} ({db['type'].upper()})")
+                                    response_parts.append(f"- **Host:** {db.get('host', 'N/A')}")
+                                    response_parts.append(f"- **Port:** {db.get('port', 'N/A')}")
+                                    if db.get("description"):
+                                        response_parts.append(f"- **Description:** {db['description']}")
+                                    response_parts.append("")
+                            else:
+                                response_parts.append("No databases found in knowledge graph.")
+                        
+                        elif schema_query["query_type"] == "tables":
+                            # Show tables for database(s)
+                            database_name = schema_query.get("database_name")
+                            
+                            # If database name not specified, show tables for all connected PostgreSQL databases
+                            if not database_name:
+                                databases = [db for db in kg_rag.get_all_databases() if db["type"] == "postgresql"]
+                                if databases:
+                                    for db in databases:
+                                        tables = kg_rag.get_tables_for_database(db["name"])
+                                        if tables:
+                                            response_parts.append(f"## 📋 Tables in {db['name']} (PostgreSQL)\n\n")
+                                            for table in tables:
+                                                response_parts.append(f"### {table['name']}")
+                                                response_parts.append(f"- **Columns:** {table['column_count']}")
+                                                if table.get("description"):
+                                                    response_parts.append(f"- **Description:** {table['description']}")
+                                                response_parts.append("")
+                                else:
+                                    response_parts.append("No PostgreSQL databases found.")
+                            else:
+                                tables = kg_rag.get_tables_for_database(database_name)
+                                if tables:
+                                    response_parts.append(f"## 📋 Tables in {database_name}\n\n")
+                                    for table in tables:
+                                        response_parts.append(f"### {table['name']}")
+                                        response_parts.append(f"- **Columns:** {table['column_count']}")
+                                        if table.get("description"):
+                                            response_parts.append(f"- **Description:** {table['description']}")
+                                        response_parts.append("")
+                                else:
+                                    response_parts.append(f"No tables found for database '{database_name}'.")
+                        
+                        elif schema_query["query_type"] == "columns":
+                            # Show columns for a table
+                            table_name = schema_query.get("table_name")
+                            database_name = schema_query.get("database_name") or st.session_state.postgres_db_name
+                            
+                            if table_name and database_name:
+                                columns = kg_rag.get_columns_for_table(table_name, database_name)
+                                if columns:
+                                    response_parts.append(f"## 📊 Columns in {table_name} table\n\n")
+                                    for col in columns:
+                                        nullable_str = " (nullable)" if col.get("nullable") else " (not null)"
+                                        response_parts.append(f"### {col['name']}")
+                                        response_parts.append(f"- **Type:** {col.get('type', 'N/A')}{nullable_str}")
+                                        if col.get("description"):
+                                            response_parts.append(f"- **Description:** {col['description']}")
+                                        response_parts.append("")
+                                else:
+                                    response_parts.append(f"No columns found for table '{table_name}' in database '{database_name}'.")
+                            else:
+                                response_parts.append("Please specify a table name. Example: 'show columns in products table'")
+                        
+                        elif schema_query["query_type"] == "collections":
+                            # Show collections for database(s)
+                            database_name = schema_query.get("database_name")
+                            
+                            # If database name not specified, show collections for all connected MongoDB databases
+                            if not database_name:
+                                databases = [db for db in kg_rag.get_all_databases() if db["type"] == "mongodb"]
+                                if databases:
+                                    for db in databases:
+                                        collections = kg_rag.get_collections_for_database(db["name"])
+                                        if collections:
+                                            response_parts.append(f"## 📦 Collections in {db['name']} (MongoDB)\n\n")
+                                            for coll in collections:
+                                                response_parts.append(f"### {coll['name']}")
+                                                response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
+                                                response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
+                                                if coll.get("description"):
+                                                    response_parts.append(f"- **Description:** {coll['description']}")
+                                                response_parts.append("")
+                                else:
+                                    response_parts.append("No MongoDB databases found.")
+                            else:
+                                collections = kg_rag.get_collections_for_database(database_name)
+                                if collections:
+                                    response_parts.append(f"## 📦 Collections in {database_name}\n\n")
+                                    for coll in collections:
+                                        response_parts.append(f"### {coll['name']}")
+                                        response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
+                                        response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
+                                        if coll.get("description"):
+                                            response_parts.append(f"- **Description:** {coll['description']}")
+                                        response_parts.append("")
+                                else:
+                                    response_parts.append(f"No collections found for database '{database_name}'.")
+                        
+                        elif schema_query["query_type"] == "fields":
+                            # Show fields for a collection
+                            collection_name = schema_query.get("collection_name")
+                            database_name = schema_query.get("database_name") or st.session_state.mongodb_db_name
+                            
+                            if collection_name and database_name:
+                                fields = kg_rag.get_fields_for_collection(collection_name, database_name)
+                                if fields:
+                                    response_parts.append(f"## 📊 Fields in {collection_name} collection\n\n")
+                                    for field in fields:
+                                        types_str = ", ".join(field.get("types", [])) if isinstance(field.get("types"), list) else field.get("types", "N/A")
+                                        nullable_str = " (nullable)" if field.get("nullable") else " (not null)"
+                                        response_parts.append(f"### {field['name']}")
+                                        response_parts.append(f"- **Types:** {types_str}{nullable_str}")
+                                        if field.get("example"):
+                                            response_parts.append(f"- **Example:** {field['example']}")
+                                        if field.get("description"):
+                                            response_parts.append(f"- **Description:** {field['description']}")
+                                        response_parts.append("")
+                                else:
+                                    response_parts.append(f"No fields found for collection '{collection_name}' in database '{database_name}'.")
+                            else:
+                                response_parts.append("Please specify a collection name. Example: 'show fields in vendors collection'")
+                        
+                        if response_parts:
+                            full_response = "\n".join(response_parts)
+                            st.markdown(full_response)
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": full_response
+                            })
+                        else:
+                            st.warning("Could not retrieve schema information. Please ensure databases are connected and schema is loaded.")
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": "Could not retrieve schema information. Please ensure databases are connected and schema is loaded."
+                            })
+                        st.rerun()
+                    except Exception as e:
+                        logger.error(f"Error retrieving schema information: {e}")
+                        st.error(f"Error retrieving schema information: {str(e)}")
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": f"Error retrieving schema information: {str(e)}"
+                        })
+                        st.rerun()
+                else:
+                    st.warning("Could not parse schema query. Please try: 'show all databases', 'show tables', 'show columns in products table', etc.")
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "Could not parse schema query. Please try: 'show all databases', 'show tables', 'show columns in products table', etc."
+                    })
+                    st.rerun()
+            
+            # Check for DB summary request (legacy support)
+            elif any(keyword in prompt.lower() for keyword in ["database summary", "db summary", "show database", "list tables", "database details", "schema summary"]):
                 logger.info("Detected database summary request")
                 try:
                     summary_parts = []
@@ -687,53 +998,11 @@ def main():
                 else:
                     st.warning("Could not parse query example. Please format it as: 'Example query for table_name: SELECT ...'")
             
-            # Check if this is an annotation
-            elif st.session_state.annotation_handler.is_annotation(prompt):
-                logger.info("Detected annotation in user message")
-                annotation = st.session_state.annotation_handler.parse_annotation(prompt)
-                
-                if annotation and st.session_state.schema_loaded:
-                    # Store annotation in knowledge graph
-                    try:
-                        st.session_state.schema_rag.add_annotation(
-                            entity_type=annotation["entity_type"],
-                            entity_name=annotation["entity_name"],
-                            content=annotation["content"],
-                            table_name=annotation.get("table_name")
-                        )
-                        entity_desc = f"{annotation['entity_type']} '{annotation['entity_name']}'"
-                        if annotation.get("table_name"):
-                            entity_desc = f"column '{annotation['entity_name']}' in table '{annotation['table_name']}'"
-                        
-                        response = f"✅ Annotation saved for {entity_desc}:\n\n{annotation['content']}"
-                        st.success(response)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": response
-                        })
-                        logger.info(f"Annotation stored: {entity_desc}")
-                    except Exception as e:
-                        error_msg = f"❌ Failed to save annotation: {str(e)}"
-                        st.error(error_msg)
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": error_msg
-                        })
-                        logger.error(f"Failed to store annotation: {e}")
-                elif not st.session_state.schema_loaded:
-                    st.warning("⚠️ Please connect to a database first before adding annotations.")
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": "⚠️ Please connect to a database first before adding annotations."
-                    })
-                else:
-                    st.warning("⚠️ Could not parse annotation. Please use format like:\n- 'The orders table contains customer purchase records'\n- 'The orders.status column stores order status values'")
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": "⚠️ Could not parse annotation. Please use format like:\n- 'The orders table contains customer purchase records'\n- 'The orders.status column stores order status values'"
-                    })
-                st.rerun()
-                return
+            # Note: Database type description handling is now done by unified intent classifier above
+            # This section is kept for fallback if unified classifier is not available
+            
+            # Note: Annotation handling is now done by unified intent classifier above
+            # This section is kept for fallback if unified classifier is not available
             
             # Check if any database is connected
             if not st.session_state.connected and not st.session_state.mongodb_connected:
@@ -777,6 +1046,10 @@ def main():
             
             # Initialize orchestrator agent if needed
             if st.session_state.orchestrator_agent is None:
+                # Update database router with knowledge graph RAG if available
+                if st.session_state.database_router and st.session_state.schema_rag and st.session_state.schema_rag.knowledge_graph_rag:
+                    st.session_state.database_router.knowledge_graph_rag = st.session_state.schema_rag.knowledge_graph_rag
+                
                 st.session_state.orchestrator_agent = OrchestratorAgent(
                     postgres_workflow_agent=st.session_state.workflow_agent,
                     mongodb_workflow_agent=st.session_state.mongodb_workflow_agent,
@@ -906,21 +1179,42 @@ def main():
             final_response = result.get("final_response", "No response generated.")
             st.markdown(final_response)
             
-            # Display results if available
-            if result.get("df") is not None:
-                df = result["df"]
-                if len(df) > 0:
+            # Display results if available - check both direct df and from sub-results
+            df = result.get("df")
+            
+            # If df not in main result, check sub-results
+            if df is None:
+                if result.get("mongodb_result"):
+                    df = result["mongodb_result"].get("df")
+                elif result.get("postgres_result"):
+                    df = result["postgres_result"].get("df")
+            
+            if df is not None:
+                if isinstance(df, pd.DataFrame) and len(df) > 0:
                     st.dataframe(df, use_container_width=True)
+                elif isinstance(df, dict):
+                    # Handle MongoDB results that might be in dict format
+                    documents = df.get("documents", [])
+                    if documents:
+                        df_dataframe = pd.DataFrame(documents)
+                        st.dataframe(df_dataframe, use_container_width=True)
             
             # Store in messages
-            # Extract queries from sub-results if available
+            # Extract queries and results from sub-results if available
             sql_query = result.get("sql_query")
             mongodb_query = result.get("mongodb_query")
+            query_results_df = df  # Use the df we already extracted above
             
             if result.get("postgres_result"):
                 sql_query = result["postgres_result"].get("sql_query") or sql_query
+                # Also get df from postgres result if not already set
+                if query_results_df is None:
+                    query_results_df = result["postgres_result"].get("df")
             if result.get("mongodb_result"):
                 mongodb_query = result["mongodb_result"].get("mongodb_query") or mongodb_query
+                # Also get df from mongodb result if not already set
+                if query_results_df is None:
+                    query_results_df = result["mongodb_result"].get("df")
             
             message_entry = {
                 "role": "assistant",
@@ -928,7 +1222,7 @@ def main():
                 "sql_query": sql_query,
                 "mongodb_query": mongodb_query,
                 "steps": result.get("steps", []),
-                "query_results": result.get("df")
+                "query_results": query_results_df
             }
             
             st.session_state.messages.append(message_entry)

@@ -89,7 +89,7 @@ We've included a Docker Compose setup to quickly spin up a PostgreSQL database w
    - Add a new server:
      - Host: `postgres`
      - Port: `5432`
-     - Database: `ecommerce_db`
+     - Database: `customer_orders_and_reviews_db` (PostgreSQL) or `vendor_supply_chain_db` (MongoDB)
      - Username: `postgres`
      - Password: `postgres`
 
@@ -103,7 +103,7 @@ We've included a Docker Compose setup to quickly spin up a PostgreSQL database w
 4. **Connect to the database in the chatbot:**
    - Host: `localhost`
    - Port: `5432`
-   - Database: `ecommerce_db`
+   - Database: `customer_orders_and_reviews_db` (PostgreSQL) or `vendor_supply_chain_db` (MongoDB)
    - Username: `postgres`
    - Password: `postgres`
 
@@ -159,7 +159,7 @@ docker-compose restart
 
 ### Example Queries for Sample Database
 
-Once connected to the `ecommerce_db`, try these natural language queries:
+Once connected to the databases, try these natural language queries:
 
 - "Show me all products in the Electronics category"
 - "What are the top 5 most expensive products?"

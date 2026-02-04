@@ -134,7 +134,7 @@ class MongoDBWorkflowAgent:
             if self.knowledge_graph_rag:
                 try:
                     # Get database connection info from state or use defaults
-                    db_name = schema_info.get("database_name", "ecommerce_db")
+                    db_name = schema_info.get("database_name", "vendor_supply_chain_db")
                     self.knowledge_graph_rag.build_graph_from_schema(
                         schema_info,
                         database_name=db_name,

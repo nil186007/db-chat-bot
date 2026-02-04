@@ -15,7 +15,7 @@ import json
 
 # MongoDB connection settings (from docker-compose.yml)
 MONGO_URI = "mongodb://admin:adminpassword@localhost:27017/"
-DATABASE_NAME = "ecommerce_db"
+DATABASE_NAME = "vendor_supply_chain_db"
 
 def load_mongodb_data():
     """Load supply chain and inventory data into MongoDB."""

@@ -4,7 +4,7 @@ This document describes the MongoDB collections containing supply chain and inve
 
 ## Overview
 
-The MongoDB database (`ecommerce_db`) contains supply chain and inventory data that complements the PostgreSQL product catalog. All products in MongoDB are linked to PostgreSQL products by `product_name`, ensuring data consistency.
+The MongoDB database (`vendor_supply_chain_db`) contains supply chain and inventory data that complements the PostgreSQL product catalog. All products in MongoDB are linked to PostgreSQL products by `product_name`, ensuring data consistency.
 
 ## Collections
 
@@ -184,7 +184,7 @@ cd docker-setup/scripts
 
 ### Method 2: JavaScript File
 ```bash
-docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin ecommerce_db < docker-setup/scripts/load_mongodb_data.js
+docker exec -i db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenticationDatabase admin vendor_supply_chain_db < docker-setup/scripts/load_mongodb_data.js
 ```
 
 ### Method 3: Python Script
@@ -262,5 +262,5 @@ docker exec -it db-chat-bot-mongodb mongosh -u admin -p adminpassword --authenti
 
 ### Connection String
 ```
-mongodb://admin:adminpassword@localhost:27017/ecommerce_db?authSource=admin
+mongodb://admin:adminpassword@localhost:27017/vendor_supply_chain_db?authSource=admin
 ```
