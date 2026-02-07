@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main script to run SQL query generation evaluation tests.
+Main script to run MongoDB query generation evaluation tests.
 """
 import sys
 from pathlib import Path
@@ -13,49 +13,70 @@ if str(src_dir) not in sys.path:
 
 import argparse
 from db_chatbot.config.settings import get_logger, setup_logging
-from db_chatbot.evaluation.evaluator import SQLQueryEvaluator
-from db_chatbot.evaluation.test_cases import TEST_CASES, get_test_cases_by_complexity
-from db_chatbot.db_clients.postgres_client import PostgresClient
-from db_chatbot.query_generator.sql_generator import SQLGenerator
+from db_chatbot.evaluation.mongodb_evaluator import MongoDBQueryEvaluator
+from db_chatbot.evaluation.mongodb_test_cases import (
+    MONGODB_TEST_CASES, 
+    get_mongodb_test_cases_by_complexity
+)
+from db_chatbot.db_clients.mongodb_client import MongoDBClient
+from db_chatbot.query_generator.mongodb_query_generator import MongoDBQueryGenerator
 from db_chatbot.query_generator.response_generator import ResponseGenerator
-from db_chatbot.rag.schema_rag import SchemaRAG
-from db_chatbot.query_intent.classifier import QueryClassifier
+from db_chatbot.rag.knowledge_graph_rag import KnowledgeGraphRAG
+from db_chatbot.db_clients.neo4j_client import Neo4jClient
 
 logger = get_logger(__name__)
 
 
 def main():
     """Main evaluation function."""
-    parser = argparse.ArgumentParser(description="Evaluate SQL query generation accuracy")
+    parser = argparse.ArgumentParser(description="Evaluate MongoDB query generation accuracy")
     parser.add_argument(
         "--host",
         type=str,
         default="localhost",
-        help="PostgreSQL host (default: localhost)"
+        help="MongoDB host (default: localhost)"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=5432,
-        help="PostgreSQL port (default: 5432)"
+        default=27017,
+        help="MongoDB port (default: 27017)"
     )
     parser.add_argument(
         "--database",
         type=str,
-        default="customer_orders_and_reviews_db",
-        help="Database name (default: customer_orders_and_reviews_db)"
+        default="vendor_supply_chain_db",
+        help="Database name (default: vendor_supply_chain_db)"
     )
     parser.add_argument(
         "--user",
         type=str,
-        default="postgres",
-        help="Database user (default: postgres)"
+        default="admin",
+        help="Database user (default: admin)"
     )
     parser.add_argument(
         "--password",
         type=str,
-        default="postgres",
-        help="Database password (default: postgres)"
+        default="adminpassword",
+        help="Database password (default: adminpassword)"
+    )
+    parser.add_argument(
+        "--neo4j-uri",
+        type=str,
+        default="bolt://localhost:7687",
+        help="Neo4j URI (default: bolt://localhost:7687)"
+    )
+    parser.add_argument(
+        "--neo4j-user",
+        type=str,
+        default="neo4j",
+        help="Neo4j user (default: neo4j)"
+    )
+    parser.add_argument(
+        "--neo4j-password",
+        type=str,
+        default="password",
+        help="Neo4j password (default: password)"
     )
     parser.add_argument(
         "--complexity",
@@ -92,47 +113,70 @@ def main():
     setup_logging(level=log_level)
     
     logger.info("=" * 80)
-    logger.info("SQL Query Generation Evaluation")
+    logger.info("MongoDB Query Generation Evaluation")
     logger.info("=" * 80)
     
-    # Connect to database
-    logger.info(f"Connecting to database: {args.host}:{args.port}/{args.database}")
-    db_client = PostgresClient()
-    success, message = db_client.connect(
+    # Connect to MongoDB
+    logger.info(f"Connecting to MongoDB: {args.host}:{args.port}/{args.database}")
+    mongodb_client = MongoDBClient()
+    success, message = mongodb_client.connect(
         host=args.host,
         port=args.port,
         database=args.database,
-        user=args.user,
+        username=args.user,
         password=args.password
     )
     
     if not success:
-        logger.error(f"Failed to connect to database: {message}")
+        logger.error(f"Failed to connect to MongoDB: {message}")
         sys.exit(1)
     
-    logger.info("Database connection established")
+    logger.info("MongoDB connection established")
     
     # Fetch schema
-    logger.info("Fetching database schema...")
-    schema_info = db_client.fetch_schema()
+    logger.info("Fetching MongoDB schema...")
+    schema_info = mongodb_client.fetch_schema()
     if not schema_info:
-        logger.error("Failed to fetch database schema")
-        db_client.close()
+        logger.error("Failed to fetch MongoDB schema")
+        mongodb_client.close()
         sys.exit(1)
     
-    logger.info(f"Schema loaded: {len(schema_info.get('tables', []))} table(s)")
+    logger.info(f"Schema loaded: {len(schema_info.get('collections', []))} collection(s)")
+    
+    # Connect to Neo4j
+    logger.info("Connecting to Neo4j...")
+    neo4j_client = Neo4jClient()
+    neo4j_success = neo4j_client.connect(
+        uri=args.neo4j_uri,
+        user=args.neo4j_user,
+        password=args.neo4j_password
+    )
+    
+    if not neo4j_success:
+        logger.warning("Failed to connect to Neo4j. Knowledge graph RAG will not be available.")
+        neo4j_client = None
     
     # Initialize components
     logger.info("Initializing components...")
     
-    # SQL Generator
-    sql_generator = SQLGenerator(model_name=args.model)
-    logger.info(f"SQL Generator initialized with model: {sql_generator.model_name}")
+    # MongoDB Query Generator
+    mongodb_query_generator = MongoDBQueryGenerator(model_name=args.model)
+    logger.info(f"MongoDB Query Generator initialized with model: {mongodb_query_generator.model_name}")
     
-    # Schema RAG
-    schema_rag = SchemaRAG()
-    schema_rag.load_schema(schema_info, database_name=args.database, host=args.host, port=args.port)
-    logger.info("Schema RAG initialized")
+    # Knowledge Graph RAG
+    knowledge_graph_rag = None
+    if neo4j_client:
+        knowledge_graph_rag = KnowledgeGraphRAG(neo4j_client)
+        knowledge_graph_rag.build_graph_from_schema(
+            schema_info=schema_info,
+            database_name=args.database,
+            host=args.host,
+            port=args.port,
+            db_type="mongodb"
+        )
+        logger.info("Knowledge Graph RAG initialized")
+    else:
+        logger.warning("Knowledge Graph RAG not available (Neo4j not connected)")
     
     # Response Generator (optional)
     try:
@@ -142,29 +186,25 @@ def main():
         logger.warning(f"Response Generator not available: {e}")
         response_generator = None
     
-    # Query Classifier (optional)
-    try:
-        query_classifier = QueryClassifier()
-        logger.info("Query Classifier initialized")
-    except Exception as e:
-        logger.warning(f"Query Classifier not available: {e}")
-        query_classifier = None
-    
     # Initialize evaluator
-    evaluator = SQLQueryEvaluator(
-        db_client=db_client,
-        sql_generator=sql_generator,
-        schema_rag=schema_rag,
-        response_generator=response_generator,
-        query_classifier=query_classifier
+    if not knowledge_graph_rag:
+        logger.error("Knowledge Graph RAG is required for MongoDB evaluation")
+        mongodb_client.close()
+        sys.exit(1)
+    
+    evaluator = MongoDBQueryEvaluator(
+        mongodb_client=mongodb_client,
+        mongodb_query_generator=mongodb_query_generator,
+        knowledge_graph_rag=knowledge_graph_rag,
+        response_generator=response_generator
     )
     
     # Show test case summary
     if args.complexity:
-        test_cases = get_test_cases_by_complexity(args.complexity)
+        test_cases = get_mongodb_test_cases_by_complexity(args.complexity)
         logger.info(f"Filtering by complexity: {args.complexity}")
     else:
-        test_cases = TEST_CASES
+        test_cases = MONGODB_TEST_CASES
     
     if args.category:
         test_cases = [tc for tc in test_cases if tc.category == args.category]
@@ -190,7 +230,7 @@ def main():
     logger.info("=" * 80)
     summary = report.get("summary", {})
     logger.info(f"Total Test Cases: {summary.get('total_test_cases', 0)}")
-    logger.info(f"SQL Generated Rate: {summary.get('sql_generated_rate', 0.0):.2%}")
+    logger.info(f"Queries Generated Rate: {summary.get('queries_generated_rate', 0.0):.2%}")
     logger.info(f"Results Match Rate: {summary.get('results_match_rate', 0.0):.2%} ⭐ (PRIMARY METRIC)")
     logger.info(f"Execution Success Rate: {summary.get('execution_success_rate', 0.0):.2%}")
     logger.info(f"Validation Pass Rate: {summary.get('validation_pass_rate', 0.0):.2%}")
@@ -223,8 +263,10 @@ def main():
     logger.info(f"Evaluation complete! Reports saved to: {output_dir.absolute()}")
     logger.info("=" * 80)
     
-    # Close database connection
-    db_client.close()
+    # Close connections
+    mongodb_client.close()
+    if neo4j_client:
+        neo4j_client.close()
     
     # Exit with appropriate code
     if summary.get('execution_success_rate', 0.0) < 0.5:

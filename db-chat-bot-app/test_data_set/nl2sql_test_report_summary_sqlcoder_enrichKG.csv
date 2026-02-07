@@ -1,0 +1,4 @@
+complexity,total,exact_acc,exec_ok_rate,result_acc,pass_rate,avg_llm_ms
+easy,25,0.0,0.0,0.0,0.0,13024.16
+medium,25,0.0,0.08,0.0,0.0,15220.28
+hard,25,0.0,0.24,0.08,0.08,19282.28

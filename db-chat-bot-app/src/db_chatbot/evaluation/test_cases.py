@@ -487,6 +487,131 @@ HAVING COUNT(DISTINCT p.category) >= 2;""",
         description="Multiple JOINs with COUNT DISTINCT and HAVING",
         category="aggregation"
     ),
+    
+    # ========== ADDITIONAL TEST CASES TO REACH 50 TOTAL ==========
+    # Simple queries (2 more)
+    TestCase(
+        id="simple_009",
+        natural_language="Show all products with their prices",
+        expected_sql="SELECT product_name, price FROM products;",
+        complexity="simple",
+        description="SELECT specific columns from single table",
+        category="basic_select"
+    ),
+    TestCase(
+        id="simple_010",
+        natural_language="How many customers do we have?",
+        expected_sql="SELECT COUNT(*) FROM customers;",
+        complexity="simple",
+        description="Simple COUNT on customers table",
+        category="aggregation"
+    ),
+    
+    # Medium queries (3 more)
+    TestCase(
+        id="medium_015",
+        natural_language="Show all reviews with product names",
+        expected_sql="""SELECT r.*, p.product_name 
+FROM reviews r 
+INNER JOIN products p ON r.product_id = p.product_id;""",
+        complexity="medium",
+        description="INNER JOIN to get product names for reviews",
+        category="joins"
+    ),
+    TestCase(
+        id="medium_016",
+        natural_language="Find the maximum price of products",
+        expected_sql="SELECT MAX(price) as max_price FROM products;",
+        complexity="medium",
+        description="MAX aggregation function",
+        category="aggregation"
+    ),
+    TestCase(
+        id="medium_017",
+        natural_language="Show orders placed after 2024-01-01",
+        expected_sql="SELECT * FROM orders WHERE order_date > '2024-01-01';",
+        complexity="medium",
+        description="Date comparison with greater than",
+        category="filtering"
+    ),
+    
+    # Complex queries (3 more)
+    TestCase(
+        id="complex_013",
+        natural_language="Find products that have been reviewed but never ordered",
+        expected_sql="""SELECT DISTINCT p.* 
+FROM products p 
+INNER JOIN reviews r ON p.product_id = r.product_id 
+WHERE p.product_id NOT IN (
+    SELECT DISTINCT product_id FROM order_items
+);""",
+        complexity="complex",
+        description="JOIN with subquery using NOT IN",
+        category="subqueries"
+    ),
+    TestCase(
+        id="complex_014",
+        natural_language="Show customers with their first order date",
+        expected_sql="""SELECT c.*, MIN(o.order_date) as first_order_date 
+FROM customers c 
+LEFT JOIN orders o ON c.customer_id = o.customer_id 
+GROUP BY c.customer_id;""",
+        complexity="complex",
+        description="LEFT JOIN with MIN aggregation",
+        category="aggregation"
+    ),
+    TestCase(
+        id="complex_015",
+        natural_language="Find the total number of items sold for each product",
+        expected_sql="""SELECT p.product_id, p.product_name, 
+       COALESCE(SUM(oi.quantity), 0) as total_items_sold 
+FROM products p 
+LEFT JOIN order_items oi ON p.product_id = oi.product_id 
+GROUP BY p.product_id, p.product_name;""",
+        complexity="complex",
+        description="LEFT JOIN with SUM and COALESCE",
+        category="aggregation"
+    ),
+    
+    # Very complex queries (2 more)
+    TestCase(
+        id="very_complex_007",
+        natural_language="Show products that have sold more units than the average units sold across all products",
+        expected_sql="""SELECT p.product_id, p.product_name, SUM(oi.quantity) as units_sold 
+FROM products p 
+INNER JOIN order_items oi ON p.product_id = oi.product_id 
+GROUP BY p.product_id, p.product_name 
+HAVING SUM(oi.quantity) > (
+    SELECT AVG(total_units) 
+    FROM (
+        SELECT SUM(oi2.quantity) as total_units 
+        FROM order_items oi2 
+        GROUP BY oi2.product_id
+    ) subquery
+);""",
+        complexity="very_complex",
+        description="Nested subquery with HAVING and aggregation comparison",
+        category="subqueries"
+    ),
+    TestCase(
+        id="very_complex_008",
+        natural_language="Find customers who have placed orders in all months where orders exist",
+        expected_sql="""SELECT c.* 
+FROM customers c 
+WHERE NOT EXISTS (
+    SELECT DISTINCT DATE_TRUNC('month', o1.order_date) as order_month 
+    FROM orders o1 
+    WHERE NOT EXISTS (
+        SELECT 1 
+        FROM orders o2 
+        WHERE o2.customer_id = c.customer_id 
+        AND DATE_TRUNC('month', o2.order_date) = DATE_TRUNC('month', o1.order_date)
+    )
+);""",
+        complexity="very_complex",
+        description="Complex nested NOT EXISTS with date functions",
+        category="subqueries"
+    ),
 ]
 
 
