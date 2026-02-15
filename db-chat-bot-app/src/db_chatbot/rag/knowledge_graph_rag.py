@@ -82,42 +82,67 @@ class KnowledgeGraphRAG:
         })
         
         if db_type == "mongodb":
-            # Process MongoDB collections
             for collection in schema_info.get("collections", []):
                 self._create_mongodb_collection_node(database_name, collection)
             logger.info(f"Knowledge graph built: {len(schema_info.get('collections', []))} collection(s) added")
         else:
-            # Process PostgreSQL tables
-            for table in schema_info.get("tables", []):
-                self._create_table_node(database_name, table)
-            logger.info(f"Knowledge graph built: {len(schema_info.get('tables', []))} table(s) added")
+            # PostgreSQL: Database -> Schema -> Table -> Column
+            if schema_info.get("schemas"):
+                for schema_obj in schema_info["schemas"]:
+                    schema_name = schema_obj["name"]
+                    for table in schema_obj.get("tables", []):
+                        table["schema_name"] = schema_name
+                        self._create_table_node(database_name, schema_name, table)
+                total = sum(len(s.get("tables", [])) for s in schema_info["schemas"])
+            else:
+                # Backward compat: flat tables (treat as public schema)
+                for table in schema_info.get("tables", []):
+                    schema_name = table.get("schema_name", "public")
+                    self._create_table_node(database_name, schema_name, table)
+                total = len(schema_info.get("tables", []))
+            logger.info(f"Knowledge graph built: {total} table(s) across schemas")
     
-    def _create_table_node(self, database_name: str, table_info: Dict):
-        """Create table node and related nodes/relationships under Database node."""
+    def _create_table_node(self, database_name: str, schema_name: str, table_info: Dict):
+        """Create Schema node (if needed), Table node, and Column nodes. Hierarchy: Database->Schema->Table->Column."""
         table_name = table_info["name"]
         
-        # Create table node linked to Database
-        table_query = """
+        # Create or get Schema node under Database
+        schema_query = """
         MATCH (db:Database {name: $db_name})
+        MERGE (s:Schema {name: $schema_name, database_name: $db_name})
+        ON CREATE SET s.description = "", s.created_at = datetime()
+        MERGE (db)-[:HAS_SCHEMA]->(s)
+        RETURN s
+        """
+        self.neo4j.execute_query(schema_query, {
+            "db_name": database_name,
+            "schema_name": schema_name
+        })
+        
+        # Create Table node linked to Schema
+        table_query = """
+        MATCH (s:Schema {name: $schema_name, database_name: $db_name})
         CREATE (t:Table {
             name: $table_name,
+            schema_name: $schema_name,
             description: "",
             query_examples: [],
             created_at: datetime(),
             database_name: $db_name
         })
-        CREATE (db)-[:HAS_TABLE]->(t)
+        CREATE (s)-[:HAS_TABLE]->(t)
         RETURN t
         """
         self.neo4j.execute_query(table_query, {
             "db_name": database_name,
+            "schema_name": schema_name,
             "table_name": table_name
         })
         
-        # Create column nodes
+        # Create Column (attribute) nodes under Table
         for col in table_info.get("columns", []):
             col_query = """
-            MATCH (t:Table {name: $table_name, database_name: $db_name})
+            MATCH (t:Table {name: $table_name, schema_name: $schema_name, database_name: $db_name})
             CREATE (c:Column {
                 name: $col_name,
                 type: $col_type,
@@ -135,6 +160,7 @@ class KnowledgeGraphRAG:
             """
             self.neo4j.execute_query(col_query, {
                 "table_name": table_name,
+                "schema_name": schema_name,
                 "db_name": database_name,
                 "col_name": col["name"],
                 "col_type": col["type"],
@@ -146,20 +172,22 @@ class KnowledgeGraphRAG:
         # Create primary key relationships
         for pk in table_info.get("primary_keys", []):
             pk_query = """
-            MATCH (t:Table {name: $table_name, database_name: $db_name})-[:HAS_COLUMN]->(c:Column {name: $pk_col, database_name: $db_name})
+            MATCH (t:Table {name: $table_name, schema_name: $schema_name, database_name: $db_name})-[:HAS_COLUMN]->(c:Column {name: $pk_col})
             CREATE (t)-[:HAS_PRIMARY_KEY]->(c)
             """
             self.neo4j.execute_query(pk_query, {
                 "table_name": table_name,
+                "schema_name": schema_name,
                 "db_name": database_name,
                 "pk_col": pk
             })
         
-        # Create foreign key relationships
+        # Create foreign key relationships (reference table may be in same or different schema)
         for fk in table_info.get("foreign_keys", []):
+            ref_schema = fk.get("references_schema", schema_name)
             fk_query = """
-            MATCH (t1:Table {name: $table_name, database_name: $db_name}),
-                  (t2:Table {name: $ref_table, database_name: $db_name})
+            MATCH (t1:Table {name: $table_name, schema_name: $schema_name, database_name: $db_name}),
+                  (t2:Table {name: $ref_table, schema_name: $ref_schema, database_name: $db_name})
             CREATE (t1)-[:HAS_FOREIGN_KEY {
                 from_column: $from_col,
                 to_column: $to_col
@@ -167,7 +195,9 @@ class KnowledgeGraphRAG:
             """
             self.neo4j.execute_query(fk_query, {
                 "table_name": table_name,
+                "schema_name": schema_name,
                 "ref_table": fk["references_table"],
+                "ref_schema": ref_schema,
                 "from_col": fk["column"],
                 "to_col": fk["references_column"],
                 "db_name": database_name
@@ -230,7 +260,8 @@ class KnowledgeGraphRAG:
         entity_name: str,
         table_name: Optional[str] = None,
         content: str = "",
-        database_name: Optional[str] = None
+        database_name: Optional[str] = None,
+        schema_name: Optional[str] = None
     ):
         """
         Add user annotation to the knowledge graph.
@@ -238,16 +269,26 @@ class KnowledgeGraphRAG:
         Args:
             entity_type: Type of entity ('table', 'column', 'database')
             entity_name: Name of the entity (table name or column name)
-            table_name: Required if entity_type is 'column'
+            table_name: Required if entity_type is 'column' (supports "schema.table" format)
             content: Annotation content/description
             database_name: Database name (optional, will find if not provided)
+            schema_name: Schema name for table/column (optional; parsed from table_name if "schema.table" format)
         """
         logger.info(f"Adding annotation for {entity_type}: {entity_name}")
         
-        # Find the entity node first
+        # Parse schema from "schema.table" format
+        eff_schema = schema_name
+        eff_table_name = entity_name if entity_type == "table" else (table_name or "")
+        if eff_table_name and "." in eff_table_name:
+            parts = eff_table_name.split(".", 1)
+            eff_schema, eff_table_name = parts[0], parts[1]
+        if not eff_schema:
+            eff_schema = "public"
+        
         params = {
-            "entity_name": entity_name,
-            "table_name": table_name,
+            "entity_name": eff_table_name if entity_type == "table" else entity_name,
+            "table_name": eff_table_name if entity_type == "column" else eff_table_name,
+            "schema_name": eff_schema,
             "db_name": database_name
         }
         
@@ -263,14 +304,14 @@ class KnowledgeGraphRAG:
         elif entity_type == "table":
             entity_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(e:Table {name: $entity_name})
             RETURN e
             LIMIT 1
             """
         elif entity_type == "column":
             entity_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->
                   (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
             RETURN e
             LIMIT 1
@@ -314,7 +355,7 @@ class KnowledgeGraphRAG:
         elif entity_type == "column":
             check_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->
                   (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
             OPTIONAL MATCH (existing:UserAnnotation)-[:DESCRIBES]->(e)
             WHERE existing.entity_type = $entity_type AND existing.entity_name = $entity_name
@@ -343,7 +384,7 @@ class KnowledgeGraphRAG:
         else:  # table
             check_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(e:Table {name: $entity_name})
             OPTIONAL MATCH (existing:UserAnnotation)-[:DESCRIBES]->(e)
             WHERE existing.entity_type = $entity_type AND existing.entity_name = $entity_name
             RETURN existing
@@ -351,10 +392,11 @@ class KnowledgeGraphRAG:
             """
         
         existing = self.neo4j.execute_query(check_query, {
-            "entity_name": entity_name,
+            "entity_name": params["entity_name"],
             "entity_type": entity_type,
             "content": content,
-            "table_name": table_name,
+            "table_name": params["table_name"],
+            "schema_name": params["schema_name"],
             "db_name": database_name
         })
         
@@ -373,7 +415,7 @@ class KnowledgeGraphRAG:
             elif entity_type == "column":
                 update_query = """
                 MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                      (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                      (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->
                       (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
                 MATCH (ann:UserAnnotation)-[:DESCRIBES]->(e)
                 WHERE ann.entity_type = $entity_type AND ann.entity_name = $entity_name
@@ -405,7 +447,7 @@ class KnowledgeGraphRAG:
             else:  # table
                 update_query = """
                 MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                      (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                      (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(e:Table {name: $entity_name})
                 MATCH (ann:UserAnnotation)-[:DESCRIBES]->(e)
                 WHERE ann.entity_type = $entity_type AND ann.entity_name = $entity_name
                 SET ann.content = $content,
@@ -413,10 +455,11 @@ class KnowledgeGraphRAG:
                 RETURN ann
                 """
             self.neo4j.execute_query(update_query, {
-                "entity_name": entity_name,
+                "entity_name": params["entity_name"],
                 "entity_type": entity_type,
                 "content": content,
-                "table_name": table_name,
+                "table_name": params["table_name"],
+                "schema_name": params["schema_name"],
                 "db_name": database_name
             })
         else:
@@ -440,13 +483,14 @@ class KnowledgeGraphRAG:
             elif entity_type == "column":
                 create_query = """
                 MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                      (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                      (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->
                       (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
                 CREATE (ann:UserAnnotation {
                     content: $content,
                     entity_type: $entity_type,
                     entity_name: $entity_name,
                     table_name: $table_name,
+                    schema_name: $schema_name,
                     database_name: $db_name,
                     created_at: datetime(),
                     updated_at: datetime()
@@ -490,12 +534,13 @@ class KnowledgeGraphRAG:
             else:  # table
                 create_query = """
                 MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                      (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                      (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(e:Table {name: $entity_name})
                 CREATE (ann:UserAnnotation {
                     content: $content,
                     entity_type: $entity_type,
                     entity_name: $entity_name,
                     table_name: null,
+                    schema_name: $schema_name,
                     database_name: $db_name,
                     created_at: datetime(),
                     updated_at: datetime()
@@ -504,10 +549,11 @@ class KnowledgeGraphRAG:
                 RETURN ann
                 """
             self.neo4j.execute_query(create_query, {
-                "entity_name": entity_name,
+                "entity_name": params["entity_name"],
                 "entity_type": entity_type,
                 "content": content,
-                "table_name": table_name,
+                "table_name": params["table_name"],
+                "schema_name": params["schema_name"],
                 "db_name": database_name
             })
         
@@ -682,12 +728,12 @@ class KnowledgeGraphRAG:
             # Search PostgreSQL tables and columns through the new hierarchy
             # Database → Table → Column (for PostgreSQL)
             cypher_query = """
-            MATCH (db:Database {type: "postgresql"})-[:HAS_TABLE]->(t:Table)
+            MATCH (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table)
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
-            WITH t, collect(c) as columns
-            RETURN t.name as table_name, t.description as table_description,
+            WITH t, s, collect(c) as columns
+            RETURN t.name as table_name, t.schema_name as schema_name, t.description as table_description,
                    columns
-            ORDER BY t.name
+            ORDER BY s.name, t.name
             """
             results = self.neo4j.execute_query(cypher_query, {})
             
@@ -736,9 +782,13 @@ class KnowledgeGraphRAG:
                 
                 if table_match_score > 0:
                     score += table_match_score
+                    schema_name = record.get("schema_name", "public")
+                    qualified_name = f'"{schema_name}".{table_name}' if schema_name != "public" else table_name
                     matched_entities.append({
                         "type": "table",
                         "name": table_name,
+                        "schema_name": schema_name,
+                        "qualified_name": qualified_name,
                         "score": table_match_score,
                         "column_matches": column_matches
                     })
@@ -867,7 +917,7 @@ class KnowledgeGraphRAG:
             # Retrieve specific tables
             cypher_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(t:Table)
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
             WHERE t.name IN $table_names
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
@@ -876,7 +926,7 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns, 
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, t.description as table_description,
+            RETURN t.name as table_name, t.schema_name as schema_name, t.description as table_description,
                    columns, table_annotations, column_annotations
             ORDER BY t.name
             """
@@ -887,7 +937,7 @@ class KnowledgeGraphRAG:
             # Search by keywords
             cypher_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(t:Table)
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
             WHERE ANY(keyword IN $keywords WHERE t.name CONTAINS keyword OR 
                      EXISTS((t)-[:HAS_COLUMN]->(c:Column {name: keyword})))
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
@@ -898,7 +948,7 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns,
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, t.description as table_description,
+            RETURN t.name as table_name, t.schema_name as schema_name, t.description as table_description,
                    columns, table_annotations, column_annotations
             ORDER BY t.name
             LIMIT 10
@@ -910,7 +960,7 @@ class KnowledgeGraphRAG:
             # Retrieve all tables
             cypher_query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(t:Table)
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
             OPTIONAL MATCH (col_ann:UserAnnotation)-[:DESCRIBES]->(c)
@@ -918,22 +968,24 @@ class KnowledgeGraphRAG:
             WITH t, collect(DISTINCT c) as columns,
                  collect(DISTINCT ann.content) as table_annotations,
                  collect(DISTINCT col_ann) as column_annotations
-            RETURN t.name as table_name, t.description as table_description,
+            RETURN t.name as table_name, t.schema_name as schema_name, t.description as table_description,
                    columns, table_annotations, column_annotations
             ORDER BY t.name
             """
             results = self.neo4j.execute_query(cypher_query, {})
         
-        # Format results
+        # Format results - include schema_name for multi-schema support
         context = "Database Schema:\n\n"
         for record in results:
             table_name = record["table_name"]
+            schema_name = record.get("schema_name", "public")
             columns = record.get("columns", [])
             table_annotations = record.get("table_annotations", [])
             column_annotations = record.get("column_annotations", [])
             table_description = record.get("table_description", "")
             
-            context += f"Table: {table_name}\n"
+            table_label = f'"{schema_name}".{table_name}' if schema_name != "public" else table_name
+            context += f"Table: {table_label}\n"
             
             # Add table description (includes query examples)
             if table_description:
@@ -977,22 +1029,115 @@ class KnowledgeGraphRAG:
         logger.debug(f"Schema context retrieved: {len(context)} characters")
         return context
     
-    def get_table_info(self, table_name: str, database_name: Optional[str] = None) -> Optional[Dict]:
+    def get_schema_info(self, database_name: Optional[str] = None) -> Optional[Dict]:
+        """
+        Retrieve full schema info from the graph in the same format as PostgresClient.fetch_schema().
+        Returns {"schemas": [...], "tables": [...]} with schema_name on each table for SQL qualification.
+        
+        Args:
+            database_name: Optional database name filter. If None, returns first PostgreSQL database.
+        
+        Returns:
+            Schema dict with tables (each having schema_name, name, columns, primary_keys, foreign_keys)
+            or None if graph has no schema.
+        """
+        db_filter = "AND db.name = $db_name" if database_name else ""
+        params = {} if not database_name else {"db_name": database_name}
+        
+        cypher = f"""
+        MATCH (db:Database {{type: "postgresql"}})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table)
+        {db_filter}
+        OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
+        OPTIONAL MATCH (t)-[:HAS_PRIMARY_KEY]->(pk:Column)
+        OPTIONAL MATCH (t)-[fk:HAS_FOREIGN_KEY]->(t2:Table)
+        WITH t, s, collect(DISTINCT c) as columns, collect(DISTINCT pk.name) as pk_names, 
+             collect(DISTINCT {{from_col: fk.from_column, to_col: fk.to_column, ref_table: t2.name, ref_schema: t2.schema_name}}) as fk_records
+        RETURN t.name as table_name, t.schema_name as schema_name, columns, pk_names, fk_records
+        ORDER BY s.name, t.name
+        """
+        results = self.neo4j.execute_query(cypher, params)
+        if not results:
+            logger.debug("No schema found in knowledge graph")
+            return None
+        
+        tables = []
+        seen_schemas: Dict[str, List[Dict]] = {}
+        for record in results:
+            table_name = record.get("table_name", "")
+            schema_name = record.get("schema_name", "public")
+            columns_raw = record.get("columns", [])
+            pk_names = [n for n in (record.get("pk_names") or []) if n]
+            fk_records = [r for r in (record.get("fk_records") or []) if r and r.get("from_col")]
+            
+            cols = []
+            for c in columns_raw:
+                if not c:
+                    continue
+                col = c if isinstance(c, dict) else (getattr(c, "__dict__", {}) or {})
+                cols.append({
+                    "name": col.get("name", ""),
+                    "type": col.get("type", "text"),
+                    "nullable": col.get("nullable", True),
+                    "default": col.get("default_value") or col.get("default", ""),
+                    "max_length": col.get("max_length"),
+                })
+            
+            fks = []
+            for r in fk_records:
+                fks.append({
+                    "column": r.get("from_col", ""),
+                    "references_schema": r.get("ref_schema", "public"),
+                    "references_table": r.get("ref_table", ""),
+                    "references_column": r.get("to_col", ""),
+                })
+            
+            table_info = {
+                "name": table_name,
+                "schema_name": schema_name,
+                "columns": cols,
+                "primary_keys": pk_names,
+                "foreign_keys": fks,
+            }
+            tables.append(table_info)
+            if schema_name not in seen_schemas:
+                seen_schemas[schema_name] = []
+            seen_schemas[schema_name].append(table_info)
+        
+        schemas = [{"name": sn, "tables": seen_schemas[sn]} for sn in sorted(seen_schemas.keys())]
+        schema_info = {"schemas": schemas, "tables": tables}
+        logger.info(f"Retrieved schema from graph: {len(tables)} table(s), {len(schemas)} schema(s)")
+        return schema_info
+    
+    def get_table_info(self, table_name: str, database_name: Optional[str] = None, schema_name: Optional[str] = None) -> Optional[Dict]:
         """Get information about a specific table from the graph."""
-        query = """
-        MATCH (db_type:DatabaseType {type: "postgresql"})-[:HAS_TABLE]->(t:Table {name: $table_name})
+        # Support "schema.table" format
+        if "." in table_name and not schema_name:
+            parts = table_name.split(".", 1)
+            schema_name, table_name = parts[0], parts[1]
+        schema_filter = "AND t.schema_name = $schema_name" if schema_name else ""
+        db_filter = "AND db.name = $db_name" if database_name else ""
+        query = f"""
+        MATCH (db:Database {{type: "postgresql"}})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table {{name: $table_name}})
+        {schema_filter} {db_filter}
         OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
         OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
         RETURN t, collect(DISTINCT c) as columns, collect(DISTINCT ann.content) as annotations
+        LIMIT 1
         """
-        results = self.neo4j.execute_query(query, {
-            "table_name": table_name
-        })
+        params = {"table_name": table_name}
+        if schema_name:
+            params["schema_name"] = schema_name
+        if database_name:
+            params["db_name"] = database_name
+        results = self.neo4j.execute_query(query, params)
         
         if results:
             record = results[0]
+            t = record.get("t")
+            table_node = t if isinstance(t, dict) else (getattr(t, "__dict__", {}) or {})
             return {
                 "name": table_name,
+                "schema_name": schema_name or table_node.get("schema_name", "public"),
                 "columns": record.get("columns", []),
                 "annotations": record.get("annotations", [])
             }
@@ -1104,22 +1249,32 @@ class KnowledgeGraphRAG:
         results = self.neo4j.execute_query(query, {"db_name": database_name})
         return results
     
-    def get_annotation(self, entity_type: str, entity_name: str, table_name: Optional[str] = None, database_name: Optional[str] = None) -> Optional[str]:
+    def get_annotation(self, entity_type: str, entity_name: str, table_name: Optional[str] = None, database_name: Optional[str] = None, schema_name: Optional[str] = None) -> Optional[str]:
         """
         Get annotation content for a specific entity.
         
         Args:
             entity_type: Type of entity ('table', 'column', 'database')
-            entity_name: Name of the entity
-            table_name: Table name (required for columns)
+            entity_name: Name of the entity (supports "schema.table" for tables)
+            table_name: Table name (required for columns; supports "schema.table")
             database_name: Database name
-        
-        Returns:
-            Annotation content string or None if not found
+            schema_name: Schema name (optional; parsed from entity/table name if "schema.table" format)
         """
+        eff_schema = schema_name or "public"
+        eff_entity = entity_name
+        eff_table = table_name
+        if entity_type == "table" and entity_name and "." in entity_name:
+            parts = entity_name.split(".", 1)
+            eff_schema, eff_entity = parts[0], parts[1]
+        elif entity_type == "column" and table_name and "." in table_name:
+            parts = table_name.split(".", 1)
+            eff_schema, eff_table = parts[0], parts[1]
+        
         params = {
-            "entity_name": entity_name,
+            "entity_name": eff_entity,
             "entity_type": entity_type,
+            "table_name": eff_table or eff_entity,
+            "schema_name": eff_schema,
             "db_name": database_name
         }
         
@@ -1132,21 +1287,20 @@ class KnowledgeGraphRAG:
             RETURN ann.content as content
             LIMIT 1
             """
-        elif entity_type == "column" and table_name:
+        elif entity_type == "column" and params.get("table_name"):
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->
                   (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
             MATCH (ann:UserAnnotation)-[:DESCRIBES]->(e)
             WHERE ann.entity_type = $entity_type AND ann.entity_name = $entity_name
             RETURN ann.content as content
             LIMIT 1
             """
-            params["table_name"] = table_name
         else:  # table
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(e:Table {name: $entity_name})
             MATCH (ann:UserAnnotation)-[:DESCRIBES]->(e)
             WHERE ann.entity_type = $entity_type AND ann.entity_name = $entity_name
             RETURN ann.content as content
@@ -1163,41 +1317,197 @@ class KnowledgeGraphRAG:
         entity_type: str,
         entity_name: str,
         query: str,
+        natural_language: str = "",
         description: str = "",
         table_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
         database_name: Optional[str] = None
     ):
         """
-        Add a query example to a node's description.
+        Add a query example as a QueryExample node linked to the entity.
+        Stored in graph for retrieval during SQL generation.
         
         Args:
             entity_type: Type of entity ('table', 'column', 'database')
-            entity_name: Name of the entity
+            entity_name: Name of the entity (table name or column name)
             query: SQL query example
+            natural_language: Natural language description of what the query does (for matching)
             description: Optional description of the query
             table_name: Table name (required for columns)
+            schema_name: Schema name (optional, default public)
             database_name: Database name
         """
         logger.info(f"Adding query example for {entity_type}: {entity_name}")
+        eff_schema = schema_name or "public"
+        eff_table = table_name or (entity_name if entity_type == "table" else None)
+        nl_text = natural_language or description or query[:80]
         
-        # Build query example text
-        example_text = f"Query Example: {query}"
-        if description:
-            example_text = f"{description}\n\n{example_text}"
+        db_filter = " WHERE db.name = $db_name" if database_name else ""
+        params = {
+            "natural_language": nl_text,
+            "sql_query": query,
+            "description": description or "",
+            "entity_type": entity_type,
+            "entity_name": entity_name,
+            "table_name": eff_table or "",
+            "schema_name": eff_schema,
+            "db_name": database_name,
+        }
+        params = {k: v for k, v in params.items() if v is not None}
         
-        # Get current description
-        current_desc = self._get_node_description(entity_type, entity_name, table_name, database_name)
+        if entity_type == "database":
+            cypher = """
+            MATCH (db:Database {name: $db_name})
+            CREATE (q:QueryExample {{
+                natural_language: $natural_language,
+                sql_query: $sql_query,
+                description: $description,
+                entity_type: 'database',
+                entity_name: $db_name,
+                created_at: datetime()
+            }})
+            CREATE (db)-[:HAS_QUERY_EXAMPLE]->(q)
+            RETURN q
+            """
+            if not database_name:
+                logger.warning("database_name required for database-level query example")
+                return
+            params["db_name"] = database_name
+        elif entity_type == "table":
+            cypher = f"""
+            MATCH (db:Database {{type: "postgresql"}})-[:HAS_SCHEMA]->(s:Schema {{name: $schema_name}})-[:HAS_TABLE]->(t:Table {{name: $entity_name}}){db_filter}
+            CREATE (q:QueryExample {{
+                natural_language: $natural_language,
+                sql_query: $sql_query,
+                description: $description,
+                entity_type: 'table',
+                entity_name: $entity_name,
+                table_name: $entity_name,
+                schema_name: $schema_name,
+                created_at: datetime()
+            }})
+            CREATE (t)-[:HAS_QUERY_EXAMPLE]->(q)
+            RETURN q
+            """
+            params["entity_name"] = entity_name
+            if database_name:
+                params["db_name"] = database_name
+        else:  # column
+            cypher = f"""
+            MATCH (db:Database {{type: "postgresql"}})-[:HAS_SCHEMA]->(s:Schema {{name: $schema_name}})-[:HAS_TABLE]->(t:Table {{name: $table_name}})-[:HAS_COLUMN]->(c:Column {{name: $entity_name}}){db_filter}
+            CREATE (q:QueryExample {{
+                natural_language: $natural_language,
+                sql_query: $sql_query,
+                description: $description,
+                entity_type: 'column',
+                entity_name: $entity_name,
+                table_name: $table_name,
+                schema_name: $schema_name,
+                created_at: datetime()
+            }})
+            CREATE (t)-[:HAS_QUERY_EXAMPLE]->(q)
+            RETURN q
+            """
+            params["table_name"] = eff_table
+            if database_name:
+                params["db_name"] = database_name
+            if not eff_table:
+                logger.warning("table_name required for column-level query example")
+                return
         
-        # Append new example
-        if current_desc:
-            new_desc = f"{current_desc}\n\n{example_text}"
+        try:
+            self.neo4j.execute_query(cypher, params)
+            logger.info(f"Query example stored in graph for {entity_type}:{entity_name}")
+        except Exception as e:
+            logger.error(f"Failed to add query example: {e}")
+            raise
+    
+    def get_query_examples(
+        self,
+        user_query: str,
+        database_name: Optional[str] = None,
+        limit: int = 5
+    ) -> List[Dict[str, str]]:
+        """
+        Retrieve query examples from the graph that match the user's natural language query.
+        Uses keyword overlap for matching. Returns examples to guide SQL generation.
+        
+        Args:
+            user_query: User's natural language question
+            database_name: Database name filter
+            limit: Max number of examples to return
+        
+        Returns:
+            List of {natural_language, sql_query, entity_type, entity_name}
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if database_name:
+            params["db_name"] = database_name
+            cypher = """
+            MATCH (db:Database {type: "postgresql", name: $db_name})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
+            OPTIONAL MATCH (t)-[:HAS_QUERY_EXAMPLE]->(q:QueryExample)
+            WITH collect(DISTINCT q) as table_examples
+            OPTIONAL MATCH (db2:Database {name: $db_name})-[:HAS_QUERY_EXAMPLE]->(q2:QueryExample)
+            WITH table_examples + collect(DISTINCT q2) as all_examples
+            UNWIND [ex IN all_examples WHERE ex IS NOT NULL] as q
+            RETURN q.natural_language as natural_language, q.sql_query as sql_query,
+                   q.entity_type as entity_type, q.entity_name as entity_name,
+                   q.table_name as table_name, q.description as description
+            LIMIT $limit * 2
+            """
         else:
-            new_desc = example_text
+            cypher = """
+            MATCH (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
+            OPTIONAL MATCH (t)-[:HAS_QUERY_EXAMPLE]->(q:QueryExample)
+            WITH db, collect(DISTINCT q) as examples
+            UNWIND [ex IN examples WHERE ex IS NOT NULL] as q
+            RETURN q.natural_language as natural_language, q.sql_query as sql_query,
+                   q.entity_type as entity_type, q.entity_name as entity_name,
+                   q.table_name as table_name, q.description as description
+            LIMIT $limit * 2
+            """
         
-        # Update node description
-        self._update_node_description(entity_type, entity_name, new_desc, table_name, database_name)
+        results = self.neo4j.execute_query(cypher, params)
+        if not results:
+            return []
         
-        logger.debug(f"Query example added to {entity_type}: {entity_name}")
+        # Score by keyword overlap with user query
+        query_words = set(user_query.lower().split())
+        scored = []
+        for r in results:
+            nl = (r.get("natural_language") or "").lower()
+            nl_words = set(nl.split())
+            overlap = len(query_words & nl_words)
+            scored.append((overlap, r))
+        
+        scored.sort(key=lambda x: -x[0])
+        selected = [r for _, r in scored[:limit]]
+        
+        return [
+            {
+                "natural_language": s.get("natural_language", ""),
+                "sql_query": s.get("sql_query", ""),
+                "entity_type": s.get("entity_type", "table"),
+                "entity_name": s.get("entity_name", ""),
+            }
+            for s in selected
+        ]
+    
+    def get_query_examples_for_table(self, table_name: str, database_name: str, schema_name: Optional[str] = None) -> List[Dict[str, str]]:
+        """Get all query examples linked to a table (for UI display)."""
+        eff_schema = schema_name or "public"
+        cypher = """
+        MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(t:Table {name: $table_name})
+        MATCH (t)-[:HAS_QUERY_EXAMPLE]->(q:QueryExample)
+        RETURN q.natural_language as natural_language, q.sql_query as sql_query
+        ORDER BY q.created_at DESC
+        """
+        results = self.neo4j.execute_query(cypher, {
+            "db_name": database_name,
+            "schema_name": eff_schema,
+            "table_name": table_name
+        })
+        return [{"natural_language": r.get("natural_language", ""), "sql_query": r.get("sql_query", "")} for r in (results or [])]
     
     def _get_node_description(self, entity_type: str, entity_name: str, table_name: Optional[str], database_name: Optional[str]) -> str:
         """Get current description from node."""
@@ -1208,7 +1518,7 @@ class KnowledgeGraphRAG:
         elif entity_type == "column":
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->
                   (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
             RETURN e.description as description
             """
@@ -1216,7 +1526,7 @@ class KnowledgeGraphRAG:
         else:  # table
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(e:Table {name: $entity_name})
             RETURN e.description as description
             """
         
@@ -1239,7 +1549,7 @@ class KnowledgeGraphRAG:
         elif entity_type == "column":
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->
                   (t:Table {name: $table_name})-[:HAS_COLUMN]->(e:Column {name: $entity_name})
             SET e.description = $description
             RETURN e
@@ -1248,7 +1558,7 @@ class KnowledgeGraphRAG:
         else:  # table
             query = """
             MATCH (root:Databases {name: "databases"})-[:HAS_DATABASE]->
-                  (db:Database {type: "postgresql"})-[:HAS_TABLE]->(e:Table {name: $entity_name})
+                  (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(e:Table {name: $entity_name})
             SET e.description = $description
             RETURN e
             """
@@ -1270,24 +1580,24 @@ class KnowledgeGraphRAG:
         # Get all tables with their columns for the specified database
         if database_name:
             query = """
-            MATCH (db:Database {name: $db_name})-[:HAS_TABLE]->(t:Table)
+            MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table)
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
-            WITH db, t, COLLECT(DISTINCT c) as columns, COLLECT(DISTINCT ann.content) as table_descriptions
-            ORDER BY t.name
-            RETURN db.name as db_name, t.name as table_name, 
+            WITH db, t, s, COLLECT(DISTINCT c) as columns, COLLECT(DISTINCT ann.content) as table_descriptions
+            ORDER BY s.name, t.name
+            RETURN db.name as db_name, t.name as table_name, t.schema_name as schema_name,
                    columns, table_descriptions
             """
             results = self.neo4j.execute_query(query, {"db_name": database_name})
         else:
             # If no database name specified, get from all PostgreSQL databases
             query = """
-            MATCH (db:Database {type: "postgresql"})-[:HAS_TABLE]->(t:Table)
+            MATCH (db:Database {type: "postgresql"})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table)
             OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
-            WITH db, t, COLLECT(DISTINCT c) as columns, COLLECT(DISTINCT ann.content) as table_descriptions
-            ORDER BY db.name, t.name
-            RETURN db.name as db_name, t.name as table_name, 
+            WITH db, t, s, COLLECT(DISTINCT c) as columns, COLLECT(DISTINCT ann.content) as table_descriptions
+            ORDER BY db.name, s.name, t.name
+            RETURN db.name as db_name, t.name as table_name, t.schema_name as schema_name,
                    columns, table_descriptions
             """
             results = self.neo4j.execute_query(query, {})
@@ -1301,10 +1611,12 @@ class KnowledgeGraphRAG:
         
         for record in results:
             table_name = record.get("table_name")
+            schema_name = record.get("schema_name", "public")
             columns = record.get("columns", [])
             descriptions = record.get("table_descriptions", [])
             
-            summary_parts.append(f"\n## Table: {table_name}")
+            table_label = f'"{schema_name}".{table_name}' if schema_name != "public" else table_name
+            summary_parts.append(f"\n## Table: {table_label}")
             
             if descriptions:
                 summary_parts.append(f"Description: {descriptions[0]}")
@@ -1339,7 +1651,7 @@ class KnowledgeGraphRAG:
         # Find tables without descriptions
         if database_name:
             table_query = """
-            MATCH (db:Database {name: $db_name})-[:HAS_TABLE]->(t:Table)
+            MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
             WHERE t.description IS NULL OR t.description = ""
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
             WHERE ann IS NULL
@@ -1347,7 +1659,7 @@ class KnowledgeGraphRAG:
             ORDER BY t.name
             """
             column_query = """
-            MATCH (db:Database {name: $db_name})-[:HAS_TABLE]->
+            MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->
                   (t:Table)-[:HAS_COLUMN]->(c:Column)
             WHERE c.description IS NULL OR c.description = ""
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
@@ -1361,7 +1673,7 @@ class KnowledgeGraphRAG:
         else:
             # If no database name specified, search all databases
             table_query = """
-            MATCH (db:Database)-[:HAS_TABLE]->(t:Table)
+            MATCH (db:Database)-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->(t:Table)
             WHERE t.description IS NULL OR t.description = ""
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(t)
             WHERE ann IS NULL
@@ -1369,7 +1681,7 @@ class KnowledgeGraphRAG:
             ORDER BY db.name, t.name
             """
             column_query = """
-            MATCH (db:Database)-[:HAS_TABLE]->
+            MATCH (db:Database)-[:HAS_SCHEMA]->(:Schema)-[:HAS_TABLE]->
                   (t:Table)-[:HAS_COLUMN]->(c:Column)
             WHERE c.description IS NULL OR c.description = ""
             OPTIONAL MATCH (ann:UserAnnotation)-[:DESCRIBES]->(c)
@@ -1418,22 +1730,19 @@ class KnowledgeGraphRAG:
     
     def get_tables_for_database(self, database_name: str) -> List[Dict[str, Any]]:
         """
-        Get all tables for a PostgreSQL database.
+        Get all tables for a PostgreSQL database (across all schemas).
         
-        Args:
-            database_name: Name of the database
-            
         Returns:
-            List of dictionaries with table information (name, description, column_count)
+            List of {name, schema_name, description, column_count}
         """
         logger.info(f"Retrieving tables for database: {database_name}")
         
         query = """
-        MATCH (db:Database {name: $db_name})-[:HAS_TABLE]->(t:Table)
+        MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table)
         OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
-        WITH t, count(c) as column_count
-        RETURN t.name as name, t.description as description, column_count
-        ORDER BY t.name
+        WITH t, s, count(c) as column_count
+        RETURN t.name as name, s.name as schema_name, t.description as description, column_count
+        ORDER BY s.name, t.name
         """
         
         results = self.neo4j.execute_query(query, {"db_name": database_name})
@@ -1441,6 +1750,7 @@ class KnowledgeGraphRAG:
         for record in results:
             tables.append({
                 "name": record.get("name", ""),
+                "schema_name": record.get("schema_name", "public"),
                 "description": record.get("description", ""),
                 "column_count": record.get("column_count", 0)
             })
@@ -1448,31 +1758,42 @@ class KnowledgeGraphRAG:
         logger.info(f"Found {len(tables)} table(s) for database {database_name}")
         return tables
     
-    def get_columns_for_table(self, table_name: str, database_name: str) -> List[Dict[str, Any]]:
+    def get_columns_for_table(
+        self, table_name: str, database_name: str, schema_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Get all columns for a table.
+        Get all columns (attributes) for a table.
         
         Args:
-            table_name: Name of the table
+            table_name: Name of the table (supports "schema.table" format)
             database_name: Name of the database
-            
-        Returns:
-            List of dictionaries with column information (name, type, description, nullable)
+            schema_name: Schema name (optional; parsed from table_name if "schema.table" format)
         """
+        if "." in table_name and not schema_name:
+            parts = table_name.split(".", 1)
+            schema_name, table_name = parts[0], parts[1]
         logger.info(f"Retrieving columns for table: {table_name} in database: {database_name}")
         
-        query = """
-        MATCH (db:Database {name: $db_name})-[:HAS_TABLE]->(t:Table {name: $table_name})
-        MATCH (t)-[:HAS_COLUMN]->(c:Column)
-        RETURN c.name as name, c.type as type, c.description as description,
-               c.nullable as nullable
-        ORDER BY c.name
-        """
+        if schema_name:
+            query = """
+            MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s:Schema {name: $schema_name})-[:HAS_TABLE]->(t:Table {name: $table_name})
+            MATCH (t)-[:HAS_COLUMN]->(c:Column)
+            RETURN c.name as name, c.type as type, c.description as description, c.nullable as nullable
+            ORDER BY c.name
+            """
+            params = {"db_name": database_name, "table_name": table_name, "schema_name": schema_name}
+        else:
+            # No schema specified - use first matching table (e.g. public schema)
+            query = """
+            MATCH (db:Database {name: $db_name})-[:HAS_SCHEMA]->(s:Schema)-[:HAS_TABLE]->(t:Table {name: $table_name})
+            WITH t LIMIT 1
+            MATCH (t)-[:HAS_COLUMN]->(c:Column)
+            RETURN c.name as name, c.type as type, c.description as description, c.nullable as nullable
+            ORDER BY c.name
+            """
+            params = {"db_name": database_name, "table_name": table_name}
         
-        results = self.neo4j.execute_query(query, {
-            "db_name": database_name,
-            "table_name": table_name
-        })
+        results = self.neo4j.execute_query(query, params)
         columns = []
         for record in results:
             columns.append({

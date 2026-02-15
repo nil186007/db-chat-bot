@@ -5,6 +5,7 @@ import psycopg2
 from psycopg2 import sql, extensions
 from typing import Dict, List, Optional, Tuple
 from db_chatbot.config.settings import get_logger
+from db_chatbot.guardrails.input_guardrails import InputGuardrails
 
 logger = get_logger(__name__)
 
@@ -41,124 +42,121 @@ class PostgresClient:
     
     def fetch_schema(self) -> Optional[Dict]:
         """
-        Fetch all table schemas from the database.
+        Fetch all schemas and their tables from the database.
+        Returns hierarchy: Database -> Schema -> Table -> Column (attributes).
         
         Returns:
-            Dictionary containing schema information
+            Dictionary with "schemas" (list of {name, tables}) and "tables" (flat list with schema_name)
         """
         if not self.connection:
             logger.warning("Cannot fetch schema: not connected to database")
             return None
         
-        logger.info("Starting schema fetch process")
-        schema_info = {
-            "tables": []
-        }
+        logger.info("Starting schema fetch - all schemas and tables")
+        schema_info: Dict = {"schemas": [], "tables": []}
         
         try:
             cursor = self.connection.cursor()
-            logger.debug("Cursor created for schema fetching")
             
-            # Get all tables from public schema (can be extended for other schemas)
-            logger.debug("Fetching list of tables")
+            # Get all user schemas (exclude system schemas)
             cursor.execute("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-                ORDER BY table_name;
+                SELECT schema_name 
+                FROM information_schema.schemata 
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                  AND schema_name NOT LIKE 'pg_temp_%'
+                  AND schema_name NOT LIKE 'pg_toast_temp_%'
+                ORDER BY schema_name;
             """)
+            schemas = [row[0] for row in cursor.fetchall()]
+            logger.info(f"Found {len(schemas)} schema(s): {schemas}")
             
-            tables = cursor.fetchall()
-            logger.info(f"Found {len(tables)} table(s) in database")
-            
-            for (table_name,) in tables:
-                logger.debug(f"Processing table: {table_name}")
-                
-                # Get column information for each table
+            for schema_name in schemas:
+                # Get all tables in this schema
                 cursor.execute("""
-                    SELECT 
-                        column_name,
-                        data_type,
-                        character_maximum_length,
-                        is_nullable,
-                        column_default
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' 
-                    AND table_name = %s
-                    ORDER BY ordinal_position;
-                """, (table_name,))
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = %s
+                      AND table_type = 'BASE TABLE'
+                    ORDER BY table_name;
+                """, (schema_name,))
+                tables = cursor.fetchall()
                 
-                columns = cursor.fetchall()
-                logger.debug(f"Found {len(columns)} column(s) in table {table_name}")
+                schema_tables = []
+                for (table_name,) in tables:
+                    table_info = self._fetch_table_info(cursor, schema_name, table_name)
+                    if table_info:
+                        table_info["schema_name"] = schema_name
+                        schema_tables.append(table_info)
+                        schema_info["tables"].append(table_info)
                 
-                # Get primary keys
-                cursor.execute("""
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    WHERE tc.table_schema = 'public'
-                    AND tc.table_name = %s
-                    AND tc.constraint_type = 'PRIMARY KEY';
-                """, (table_name,))
-                
-                primary_keys = [row[0] for row in cursor.fetchall()]
-                
-                # Get foreign keys
-                cursor.execute("""
-                    SELECT
-                        kcu.column_name,
-                        ccu.table_name AS foreign_table_name,
-                        ccu.column_name AS foreign_column_name
-                    FROM information_schema.table_constraints AS tc
-                    JOIN information_schema.key_column_usage AS kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    JOIN information_schema.constraint_column_usage AS ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                    WHERE tc.constraint_type = 'FOREIGN KEY'
-                    AND tc.table_schema = 'public'
-                    AND tc.table_name = %s;
-                """, (table_name,))
-                
-                foreign_keys = cursor.fetchall()
-                
-                table_info = {
-                    "name": table_name,
-                    "columns": [],
-                    "primary_keys": primary_keys,
-                    "foreign_keys": []
-                }
-                
-                for col in columns:
-                    column_info = {
-                        "name": col[0],
-                        "type": col[1],
-                        "max_length": col[2],
-                        "nullable": col[3] == "YES",
-                        "default": col[4]
-                    }
-                    table_info["columns"].append(column_info)
-                
-                for fk in foreign_keys:
-                    table_info["foreign_keys"].append({
-                        "column": fk[0],
-                        "references_table": fk[1],
-                        "references_column": fk[2]
-                    })
-                
-                schema_info["tables"].append(table_info)
+                schema_info["schemas"].append({
+                    "name": schema_name,
+                    "tables": schema_tables
+                })
             
             cursor.close()
-            logger.info(f"Schema fetch completed successfully. Loaded {len(schema_info['tables'])} table(s)")
+            total_tables = len(schema_info["tables"])
+            logger.info(f"Schema fetch completed. {len(schemas)} schema(s), {total_tables} table(s)")
             return schema_info
             
         except psycopg2.Error as e:
             logger.error(f"Error fetching schema: {str(e)}")
             return None
     
+    def _fetch_table_info(self, cursor, schema_name: str, table_name: str) -> Optional[Dict]:
+        """Fetch column and constraint info for a single table."""
+        cursor.execute("""
+            SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position;
+        """, (schema_name, table_name))
+        columns = cursor.fetchall()
+        
+        cursor.execute("""
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.table_schema = %s AND tc.table_name = %s AND tc.constraint_type = 'PRIMARY KEY';
+        """, (schema_name, table_name))
+        primary_keys = [row[0] for row in cursor.fetchall()]
+        
+        cursor.execute("""
+            SELECT kcu.column_name, ccu.table_schema, ccu.table_name, ccu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+            JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name
+            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s AND tc.table_name = %s;
+        """, (schema_name, table_name))
+        foreign_keys_raw = cursor.fetchall()
+        
+        table_info = {
+            "name": table_name,
+            "columns": [],
+            "primary_keys": primary_keys,
+            "foreign_keys": []
+        }
+        for col in columns:
+            table_info["columns"].append({
+                "name": col[0],
+                "type": col[1],
+                "max_length": col[2],
+                "nullable": col[3] == "YES",
+                "default": col[4]
+            })
+        for fk in foreign_keys_raw:
+            table_info["foreign_keys"].append({
+                "column": fk[0],
+                "references_schema": fk[1],
+                "references_table": fk[2],
+                "references_column": fk[3]
+            })
+        return table_info
+    
     def execute_query(self, query: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
         """
         Execute a SQL query and return results.
+        Validates for SQL injection and SELECT-only before execution.
         
         Returns:
             Tuple of (success: bool, results: Dict, error_message: str)
@@ -166,7 +164,13 @@ class PostgresClient:
         if not self.connection:
             logger.warning("Cannot execute query: not connected to database")
             return False, None, "Not connected to database"
-        
+
+        # Mandatory pre-execution check: block SQL injection and non-SELECT
+        is_valid, validation_error = InputGuardrails.validate_query(query)
+        if not is_valid:
+            logger.warning(f"Query blocked before execution: {validation_error}")
+            return False, None, validation_error
+
         logger.info(f"Executing query: {query[:100]}...")
         cursor = None
         try:

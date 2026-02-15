@@ -404,7 +404,8 @@ class SQLQueryEvaluator:
     def evaluate_all(
         self,
         complexity_filter: Optional[str] = None,
-        category_filter: Optional[str] = None
+        category_filter: Optional[str] = None,
+        limit: Optional[int] = None
     ) -> List[EvaluationResult]:
         """
         Evaluate all test cases (or filtered subset).
@@ -412,6 +413,7 @@ class SQLQueryEvaluator:
         Args:
             complexity_filter: Filter by complexity level (simple, medium, complex, very_complex)
             category_filter: Filter by category
+            limit: Max number of test cases to run (for quick testing). None = run all.
         
         Returns:
             List of EvaluationResult objects
@@ -424,6 +426,10 @@ class SQLQueryEvaluator:
         
         if category_filter:
             test_cases = [tc for tc in test_cases if tc.category == category_filter]
+        
+        if limit is not None and limit > 0:
+            test_cases = test_cases[:limit]
+            logger.info(f"Quick test mode: evaluating first {len(test_cases)} test case(s)")
         
         logger.info(f"Evaluating {len(test_cases)} test case(s)")
         

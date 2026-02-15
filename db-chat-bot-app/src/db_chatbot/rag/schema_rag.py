@@ -33,12 +33,14 @@ class SchemaRAG:
         Load schema information into RAG storage.
         
         Args:
-            schema_info: Schema dictionary from PostgresClient.fetch_schema()
+            schema_info: Schema dict from PostgresClient.fetch_schema() (schemas + flat tables with schema_name)
             database_name: Database name (required if using KnowledgeGraphRAG)
             host: Database host (required if using KnowledgeGraphRAG)
             port: Database port (required if using KnowledgeGraphRAG)
         """
-        logger.info(f"Loading schema into RAG: {len(schema_info.get('tables', []))} table(s)")
+        table_count = len(schema_info.get("tables", []))
+        schema_count = len(schema_info.get("schemas", []))
+        logger.info(f"Loading schema into RAG: {schema_count} schema(s), {table_count} table(s)")
         
         # Store in-memory for backward compatibility
         self.schema_info = schema_info
@@ -62,11 +64,21 @@ class SchemaRAG:
     def get_schema(self) -> Optional[Dict]:
         """
         Retrieve the stored schema information.
+        Prefers schema from GraphDatabase (Neo4j) when available for accurate schema names.
+        Falls back to in-memory schema from Postgres.
         
         Returns:
             Schema dictionary or None if not loaded
         """
-        # Return in-memory schema (backward compatibility)
+        if self.knowledge_graph_rag and self.database_name:
+            try:
+                graph_schema = self.knowledge_graph_rag.get_schema_info(database_name=self.database_name)
+                if graph_schema and graph_schema.get("tables"):
+                    logger.debug("Retrieving schema from GraphDatabase (Neo4j)")
+                    return graph_schema
+            except Exception as e:
+                logger.warning(f"Failed to retrieve schema from graph: {e}, falling back to in-memory")
+        
         if self.schema_info:
             logger.debug("Retrieving schema from in-memory storage")
             return self.schema_info
@@ -103,6 +115,13 @@ class SchemaRAG:
             if table["name"].lower() == table_name.lower():
                 logger.debug(f"Retrieved table info from memory: {table_name}")
                 return table
+        # Support "schema.table" format
+        if "." in table_name:
+            schema_part, name_part = table_name.split(".", 1)
+            for table in self.schema_info.get("tables", []):
+                if (table.get("schema_name", "public") == schema_part and 
+                    table["name"].lower() == name_part.lower()):
+                    return table
         
         logger.warning(f"Table '{table_name}' not found in schema")
         return None
@@ -207,7 +226,9 @@ class SchemaRAG:
             tables_to_include = self.schema_info.get("tables", [])
         
         for table in tables_to_include:
-            schema_text += f"Table: {table['name']}\n"
+            schema_name = table.get("schema_name", "public")
+            table_label = f'"{schema_name}".{table["name"]}' if schema_name != "public" else table["name"]
+            schema_text += f"Table: {table_label}\n"
             schema_text += "Columns:\n"
             
             for col in table["columns"]:
@@ -222,37 +243,64 @@ class SchemaRAG:
             if table.get("foreign_keys"):
                 schema_text += "Foreign Keys:\n"
                 for fk in table["foreign_keys"]:
-                    schema_text += f"  - {fk['column']} -> {fk['references_table']}.{fk['references_column']}\n"
+                    ref_schema = fk.get("references_schema")
+                    ref_table = f'"{ref_schema}".{fk["references_table"]}' if ref_schema and ref_schema != "public" else fk["references_table"]
+                    schema_text += f"  - {fk['column']} -> {ref_table}.{fk['references_column']}\n"
             
             schema_text += "\n"
         
         logger.debug(f"Formatted schema context: {len(schema_text)} characters for {len(tables_to_include)} table(s)")
         return schema_text
     
+    def get_query_examples(self, user_query: str, limit: int = 5) -> List[Dict]:
+        """
+        Retrieve query examples from the knowledge graph that match the user query.
+        Returns examples to guide SQL generation.
+        
+        Returns:
+            List of {natural_language, sql_query, entity_type, entity_name}
+        """
+        if self.knowledge_graph_rag and self.database_name:
+            try:
+                return self.knowledge_graph_rag.get_query_examples(
+                    user_query=user_query,
+                    database_name=self.database_name,
+                    limit=limit
+                )
+            except Exception as e:
+                logger.warning(f"Failed to get query examples from graph: {e}")
+        return []
+    
     def add_annotation(
         self,
         entity_type: str,
         entity_name: str,
         content: str,
-        table_name: Optional[str] = None
+        table_name: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        database_name: Optional[str] = None
     ):
         """
         Add user annotation to the schema.
         
         Args:
             entity_type: Type of entity ('table', 'column', 'database')
-            entity_name: Name of the entity
+            entity_name: Name of the entity (supports "schema.table" for tables)
             content: Annotation content
-            table_name: Table name (required for column annotations)
+            table_name: Table name (required for column annotations; supports "schema.table")
+            schema_name: Schema name (optional; parsed from names if "schema.table" format)
+            database_name: Database name (optional; uses instance default if not provided)
         """
-        if self.knowledge_graph_rag and self.database_name:
+        db_name = database_name or self.database_name
+        if self.knowledge_graph_rag and db_name:
             try:
                 self.knowledge_graph_rag.add_annotation(
                     entity_type=entity_type,
                     entity_name=entity_name,
                     table_name=table_name,
                     content=content,
-                    database_name=self.database_name
+                    database_name=db_name,
+                    schema_name=schema_name
                 )
                 logger.info(f"Annotation added to knowledge graph: {entity_type}:{entity_name}")
             except Exception as e:
@@ -264,15 +312,17 @@ class SchemaRAG:
         self,
         entity_type: str,
         entity_name: str,
-        table_name: Optional[str] = None
+        table_name: Optional[str] = None,
+        schema_name: Optional[str] = None
     ) -> Optional[str]:
         """
         Get annotation content for a specific entity.
         
         Args:
             entity_type: Type of entity ('table', 'column', 'database')
-            entity_name: Name of the entity
-            table_name: Table name (required for columns)
+            entity_name: Name of the entity (supports "schema.table" for tables)
+            table_name: Table name (required for columns; supports "schema.table")
+            schema_name: Schema name (optional)
         
         Returns:
             Annotation content string or None if not found
@@ -283,7 +333,8 @@ class SchemaRAG:
                     entity_type=entity_type,
                     entity_name=entity_name,
                     table_name=table_name,
-                    database_name=self.database_name
+                    database_name=self.database_name,
+                    schema_name=schema_name
                 )
             except Exception as e:
                 logger.error(f"Failed to get annotation from knowledge graph: {e}")

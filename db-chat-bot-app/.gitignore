@@ -49,3 +49,7 @@ logs/
 
 # Matplotlib cache
 .matplotlib_cache/
+
+# Large data files
+docker-setup/scripts/olist_load.sql
+jupiter_note_books/scripts/*.sqlite

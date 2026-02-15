@@ -41,15 +41,15 @@ class AnnotationHandler:
     
     def _llm_is_annotation(self, message: str) -> bool:
         """Use LLM to determine if message is an annotation request."""
-        prompt = f"""You are a database assistant. A user has sent a message. Determine if this message is requesting to ADD, UPDATE, or DESCRIBE metadata/descriptions for database entities (databases, tables, columns, collections, fields).
+        prompt = f"""You are a database assistant. A user has sent a message. Determine if this message is requesting to ADD, UPDATE, or DESCRIBE metadata/descriptions for database entities (databases, tables, columns).
 
 User Message: {message}
 
 Answer with ONLY one word: "YES" or "NO"
 
 Answer "YES" if the message:
-- Requests to add/update/describe metadata for a database, table, column, collection, or field
-- Examples: "add description to table products", "update metadata for column product_id", "describe the vendors collection", "add description for database customer_orders_and_reviews_db that it contains..."
+- Requests to add/update/describe metadata for a database, table, or column
+- Examples: "add description to table products", "update metadata for column product_id", "add description for database customer_orders_and_reviews_db that it contains..."
 - Mentions adding descriptions, metadata, annotations, or information about schema entities
 
 Answer "NO" if the message:
@@ -240,54 +240,29 @@ JSON:"""
                 "content": content
             }
         
-        # Try to parse collection annotation (MongoDB)
-        coll_match = re.search(r"the\s+['\"]?(\w+)['\"]?\s+collection\s+(?:contains|stores|has|is|represents|describes|means)\s+(.+)", message_lower)
-        if coll_match:
-            collection_name = coll_match.group(1)
-            content = message[message_lower.find(coll_match.group(2)):].strip()
-            return {
-                "entity_type": "collection",
-                "entity_name": collection_name,
-                "table_name": None,
-                "content": content
-            }
-        
-        # Try to parse field annotation with collection.field format
-        field_dot_match = re.search(r"the\s+['\"]?(\w+)\.(\w+)['\"]?\s+field\s+(?:stores|contains|is|represents)\s+(.+)", message_lower)
+        # Try to parse field annotation (column in table context for SQL)
+        field_dot_match = re.search(r"the\s+['\"]?(\w+)\.(\w+)['\"]?\s+(?:column|field)\s+(?:stores|contains|is|represents)\s+(.+)", message_lower)
         if field_dot_match:
-            collection_name = field_dot_match.group(1)
+            table_name = field_dot_match.group(1)
             field_name = field_dot_match.group(2)
             content = message[message_lower.find(field_dot_match.group(3)):].strip()
             return {
-                "entity_type": "field",
+                "entity_type": "column",
                 "entity_name": field_name,
-                "table_name": collection_name,  # Reuse table_name for collection_name
+                "table_name": table_name,
                 "content": content
             }
         
-        # Try to parse field annotation with "field in collection" format
-        field_in_coll_match = re.search(r"the\s+['\"]?(\w+)['\"]?\s+field\s+(?:in|of|for)\s+(?:the\s+)?['\"]?(\w+)['\"]?\s+collection\s+(?:stores|contains|is|represents)\s+(.+)", message_lower)
-        if field_in_coll_match:
-            field_name = field_in_coll_match.group(1)
-            collection_name = field_in_coll_match.group(2)
-            content = message[message_lower.find(field_in_coll_match.group(3)):].strip()
+        # Try to parse column annotation with "column/field in table" format
+        field_in_table_match = re.search(r"the\s+['\"]?(\w+)['\"]?\s+(?:column|field)\s+(?:in|of|for)\s+(?:the\s+)?['\"]?(\w+)['\"]?\s+(?:table|collection)\s+(?:stores|contains|is|represents)\s+(.+)", message_lower)
+        if field_in_table_match:
+            col_name = field_in_table_match.group(1)
+            table_name = field_in_table_match.group(2)
+            content = message[message_lower.find(field_in_table_match.group(3)):].strip()
             return {
-                "entity_type": "field",
-                "entity_name": field_name,
-                "table_name": collection_name,  # Reuse table_name for collection_name
-                "content": content
-            }
-        
-        # Try to parse attribute annotation (alternative to field)
-        attr_match = re.search(r"the\s+['\"]?(\w+)['\"]?\s+attribute\s+(?:in|of|for)\s+(?:the\s+)?['\"]?(\w+)['\"]?\s+collection\s+(?:stores|contains|is|represents)\s+(.+)", message_lower)
-        if attr_match:
-            attr_name = attr_match.group(1)
-            collection_name = attr_match.group(2)
-            content = message[message_lower.find(attr_match.group(3)):].strip()
-            return {
-                "entity_type": "field",
-                "entity_name": attr_name,
-                "table_name": collection_name,  # Reuse table_name for collection_name
+                "entity_type": "column",
+                "entity_name": col_name,
+                "table_name": table_name,
                 "content": content
             }
         

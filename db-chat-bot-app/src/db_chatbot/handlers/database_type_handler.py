@@ -1,5 +1,6 @@
 """
 Handler for parsing database type descriptions from user messages.
+Supports SQL databases (PostgreSQL) only.
 """
 import re
 from typing import Optional, Dict
@@ -9,44 +10,26 @@ logger = get_logger(__name__)
 
 
 class DatabaseTypeHandler:
-    """Handler for parsing database type descriptions."""
-    
+    """Handler for parsing database type descriptions (SQL databases)."""
+
     def is_database_type_description(self, message: str) -> bool:
         """
         Check if the message contains a database type description.
-        
-        Examples:
-        - "PostgreSQL stores: products, orders, customers, reviews"
-        - "MongoDB contains: vendors, inventory, shipments"
-        - "Postgres database has: sales data, customer information"
+        Examples: "PostgreSQL stores: products, orders", "Postgres database has: sales data"
         """
         message_lower = message.lower()
-        
-        # Patterns for database type descriptions
         patterns = [
             r'(postgresql|postgres|pg)\s+(stores|contains|has|holds|manages|includes)',
-            r'(mongodb|mongo)\s+(stores|contains|has|holds|manages|includes)',
             r'(postgresql|postgres|pg)\s+database\s+(stores|contains|has|holds|manages|includes)',
-            r'(mongodb|mongo)\s+database\s+(stores|contains|has|holds|manages|includes)',
         ]
-        
         return any(re.search(pattern, message_lower) for pattern in patterns)
-    
+
     def parse_database_type_description(self, message: str) -> Optional[Dict]:
-        """
-        Parse database type description from message.
-        
-        Returns:
-            Dictionary with 'db_type' and 'description' keys, or None if parsing fails
-        """
+        """Parse database type description from message."""
         message_lower = message.lower()
-        
-        # Determine database type
         db_type = None
         if re.search(r'(postgresql|postgres|pg)', message_lower):
             db_type = "postgresql"
-        elif re.search(r'(mongodb|mongo)', message_lower):
-            db_type = "mongodb"
         
         if not db_type:
             return None
@@ -67,11 +50,9 @@ class DatabaseTypeHandler:
                     description = description[:-1]
                 break
         
-        # If no pattern matched, try to extract everything after the database name
         if not description:
-            # Try to find content after database type mention
             match = re.search(
-                r'(?:postgresql|postgres|pg|mongodb|mongo)[\s:]+(.+)',
+                r'(?:postgresql|postgres|pg)[\s:]+(.+)',
                 message,
                 re.IGNORECASE
             )

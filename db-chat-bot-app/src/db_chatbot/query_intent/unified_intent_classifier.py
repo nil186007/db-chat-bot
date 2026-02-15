@@ -1,7 +1,7 @@
 """
 Unified Intent Classifier that determines query intent and routes to appropriate handler.
 This is the most critical component that classifies user queries into:
-1. DB_QUERY - Execute database query (PostgreSQL or MongoDB)
+1. DB_QUERY - Execute database query (SQL/PostgreSQL)
 2. METADATA_UPDATE - Update metadata/annotations in RAG
 3. SCHEMA_QUERY - Answer from RAG schema information
 4. GENERAL_QUESTION - General conversation/greeting
@@ -44,7 +44,7 @@ class UnifiedIntentClassifier:
                 "confidence": float (0.0-1.0),
                 "details": {
                     # For DB_QUERY:
-                    "target_db": "postgresql" | "mongodb" | "both" | "unknown",
+                    "target_db": "postgresql" | "unknown",
                     
                     # For METADATA_UPDATE:
                     "entity_type": "database" | "table" | "column" | "collection" | "field",
@@ -130,23 +130,22 @@ User Query: {user_query}
 Analyze the query and classify it into ONE of these categories:
 
 1. **DB_QUERY**: The user wants to query/retrieve actual DATA from the database
-   - Examples: "show all vendors", "list products", "how many orders", "show product name and total quantity", "find customers who ordered more than 5 items", "get vendor details for product X"
+   - Examples: "show all products", "list orders", "how many orders", "show product name and total quantity", "find customers who ordered more than 5 items"
    - Keywords: actual data values, records, filtering, aggregations, calculations, counts, sums, joins
-   - Action: Execute SQL or MongoDB query to retrieve data
-   - For DB_QUERY, also determine target_db: "postgresql" (for products, orders, customers, reviews), "mongodb" (for vendors, inventory, shipments, purchase orders), "both" (if needs data from both), or "unknown"
+   - Action: Execute SQL query to retrieve data
+   - For DB_QUERY, target_db is always "postgresql" (SQL databases only)
 
 2. **METADATA_UPDATE**: The user wants to ADD, UPDATE, or DESCRIBE metadata/annotations for database entities
-   - Examples: "add description to table products that it contains product information", "update metadata for column product_id that it is unique identifier", "add description for database customer_orders_and_reviews_db that it contains all orders and reviews", "describe the vendors collection as storing supplier information", "PostgreSQL stores: products, orders, customers, sales data", "MongoDB contains: vendors, inventory, shipments, purchase orders"
-   - Keywords: "add description", "update metadata", "describe", "annotation", "metadata for", "description for", "[database_type] stores:", "[database_type] contains:"
+   - Examples: "add description to table products that it contains product information", "update metadata for column product_id that it is unique identifier", "PostgreSQL stores: products, orders, customers, sales data"
+   - Keywords: "add description", "update metadata", "describe", "annotation", "metadata for", "description for", "[database_type] stores:"
    - Action: Store/update metadata in knowledge graph (RAG)
-   - For METADATA_UPDATE, extract: entity_type (database/table/column/collection/field), entity_name, table_name (if column/field), content (description)
-   - Special case: If query is like "PostgreSQL stores: ..." or "MongoDB contains: ...", entity_type should be "database", entity_name should be the database name (if specified) or null, content should be the description after the colon
+   - For METADATA_UPDATE, extract: entity_type (database/table/column), entity_name, table_name (if column), content (description)
 
 3. **SCHEMA_QUERY**: The user wants to see SCHEMA STRUCTURE/METADATA, not actual data
-   - Examples: "show all databases", "what databases are available", "list tables", "show columns in products table", "show collections", "show fields in vendors collection"
-   - Keywords: schema structure, what tables/columns/collections/fields exist, database structure
+   - Examples: "show all databases", "what databases are available", "list tables", "show columns in products table"
+   - Keywords: schema structure, what tables/columns exist, database structure
    - Action: Retrieve and display schema information from knowledge graph (RAG)
-   - For SCHEMA_QUERY, extract: query_type (databases/tables/columns/collections/fields), database_name (optional), table_name (optional), collection_name (optional)
+   - For SCHEMA_QUERY, extract: query_type (databases/tables/columns), database_name (optional), table_name (optional)
 
 4. **GENERAL_QUESTION**: Greeting, help request, or general conversation
    - Examples: "hello", "hi", "what can you do", "help", "how does this work"
@@ -155,8 +154,6 @@ Analyze the query and classify it into ONE of these categories:
 CRITICAL DISTINCTIONS:
 
 **DB_QUERY vs SCHEMA_QUERY:**
-- "show all vendors" = DB_QUERY (retrieving vendor records/data)
-- "show vendors collection" or "show fields in vendors collection" = SCHEMA_QUERY (showing collection structure)
 - "list products" = DB_QUERY (retrieving product data)
 - "list tables" = SCHEMA_QUERY (showing table names/structure)
 - "show product name" = DB_QUERY (retrieving product names)
@@ -179,19 +176,18 @@ Return a JSON object with this exact structure:
     "confidence": 0.0-1.0,
     "details": {{
         // For DB_QUERY:
-        "target_db": "postgresql" | "mongodb" | "both" | "unknown",
+        "target_db": "postgresql" | "unknown",
         
         // For METADATA_UPDATE:
-        "entity_type": "database" | "table" | "column" | "collection" | "field" | null,
+        "entity_type": "database" | "table" | "column" | null,
         "entity_name": "string" | null,
         "table_name": "string" | null,  // For columns/fields
         "content": "string" | null,  // Description/metadata content
         
         // For SCHEMA_QUERY:
-        "query_type": "databases" | "tables" | "columns" | "collections" | "fields" | null,
+        "query_type": "databases" | "tables" | "columns" | null,
         "database_name": "string" | null,
-        "table_name": "string" | null,  // For columns
-        "collection_name": "string" | null  // For fields
+        "table_name": "string" | null
     }}
 }}
 

@@ -6,11 +6,13 @@ from typing import List, Optional, Dict, TypedDict, Literal, Annotated
 from langgraph.graph import StateGraph, END
 from db_chatbot.config.settings import get_logger
 from db_chatbot.guardrails.input_guardrails import InputGuardrails
+from db_chatbot.guardrails.output_guardrails import OutputGuardrails
 from db_chatbot.query_generator.sql_generator import SQLGenerator
 from db_chatbot.query_generator.response_generator import ResponseGenerator
 from db_chatbot.db_clients.postgres_client import PostgresClient
 from db_chatbot.rag.schema_rag import SchemaRAG
 from db_chatbot.query_intent.classifier import QueryClassifier
+import re
 import pandas as pd
 import ollama
 
@@ -43,7 +45,7 @@ class WorkflowAgent:
         schema_rag: SchemaRAG,
         response_generator: Optional[ResponseGenerator] = None,
         query_classifier: Optional[QueryClassifier] = None,
-        max_retries: int = 3
+        max_retries: int = 2
     ):
         """
         Initialize workflow agent with LangGraph.
@@ -54,7 +56,7 @@ class WorkflowAgent:
             schema_rag: Schema RAG instance for schema retrieval
             response_generator: Response generator instance (optional)
             query_classifier: Query classifier instance (optional)
-            max_retries: Maximum number of retry attempts
+            max_retries: Maximum number of retry attempts on execution failure (default: 2)
         """
         self.sql_generator = sql_generator
         self.db_client = db_client
@@ -93,6 +95,15 @@ class WorkflowAgent:
                       "Checking query type and guardrails...")
         
         user_query = state["user_query"]
+
+        # Early validation: reject dangerous intents and SQL injection in user input
+        is_safe, input_error = InputGuardrails.validate_user_input(user_query)
+        if not is_safe:
+            self._log_step(state, 1, "Input Validation & Classification", "error",
+                          f"Blocked: {input_error}", error=input_error)
+            state["final_response"] = f"⛔ **Not allowed**\n\n{input_error}"
+            state["query_type"] = "general_question"  # Route to end
+            return state
         
         # Use QueryClassifier if available
         if self.query_classifier:
@@ -199,12 +210,18 @@ class WorkflowAgent:
         )
         logger.info(f"  Schema Context Length: {len(schema_context)} characters")
         
+        # Fetch query examples from graph (when available) to guide SQL generation
+        query_examples = []
+        if self.schema_rag.knowledge_graph_rag and self.schema_rag.database_name:
+            query_examples = self.schema_rag.get_query_examples(state["user_query"], limit=5)
+        
         # For backward compatibility, still pass schema_info but use enhanced context in prompt
         sql_query = self.sql_generator.generate_sql(
             natural_language_query=state["user_query"],
             schema_info=state["schema_info"],
             conversation_history=state.get("conversation_history", []),
-            enhanced_context=schema_context  # Pass enhanced context
+            enhanced_context=schema_context,
+            query_examples=query_examples
         )
         
         if not sql_query:
@@ -246,20 +263,33 @@ class WorkflowAgent:
     
     def _should_retry_validation(self, state: AgentState) -> Literal["fix_query", "execute_query"]:
         """Conditional edge: Route based on validation result."""
-        if state.get("validation_error"):
+        validation_error = state.get("validation_error")
+        if validation_error:
             retry_count = state.get("retry_count", 0)
+            # Security violations (forbidden ops, SQL injection) must NOT be retried
+            if InputGuardrails.is_security_violation(validation_error):
+                state["final_response"] = (
+                    f"⛔ **Query not allowed**\n\n{validation_error}\n\n"
+                    "Only SELECT queries are permitted. Data modification (DELETE, UPDATE, etc.) "
+                    "and other write operations are blocked by security policy."
+                )
+                return "execute_query"  # Skips execution, goes to end
             if retry_count < self.max_retries:
                 return "fix_query"
             else:
-                state["final_response"] = f"SQL validation failed after {self.max_retries} attempts: {state.get('validation_error')}"
-                return "execute_query"  # Will go to end
+                state["final_response"] = f"SQL validation failed after {self.max_retries} attempts: {validation_error}"
+                return "execute_query"
         return "execute_query"
     
     def _execute_query_node(self, state: AgentState) -> AgentState:
         """Node: Execute SQL query using db_client tool."""
-        # Check if we should skip execution (validation failed max retries)
-        if state.get("validation_error") and state.get("retry_count", 0) >= self.max_retries:
-            return state
+        # Skip execution when validation failed (security violation or max retries exceeded)
+        validation_error = state.get("validation_error")
+        if validation_error:
+            if InputGuardrails.is_security_violation(validation_error):
+                return state  # Already have final_response set
+            if state.get("retry_count", 0) >= self.max_retries:
+                return state
         
         retry_count = state.get("retry_count", 0)
         step_num = 3 + (retry_count * 2) + 2
@@ -332,7 +362,8 @@ class WorkflowAgent:
                       "in_progress", f"Attempting to fix SQL query. Previous error: {error[:100] if error else 'Unknown error'}...",
                       sql_query=failed_query, error=error)
         
-        fixed_query = self._fix_query(failed_query, error, user_query)
+        schema_info = state.get("schema_info")
+        fixed_query = self._fix_query(failed_query, error, user_query, schema_info)
         if fixed_query and fixed_query != failed_query:
             state["sql_query"] = fixed_query
             # Log the fixed query
@@ -359,6 +390,7 @@ class WorkflowAgent:
         results = state.get("query_results")
         if results:
             df = pd.DataFrame(results["rows"], columns=results["columns"])
+            df = OutputGuardrails.mask_sensitive_dataframe(df)
             state["df"] = df
             row_count = len(df)
             logger.info(f"  Processing {row_count} rows for response generation")
@@ -493,7 +525,7 @@ class WorkflowAgent:
         query_lower = user_query.lower()
         
         greeting_words = ['hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening']
-        if any(word in query_lower for word in greeting_words):
+        if any(re.search(r'\b' + re.escape(w) + r'\b', query_lower) for w in greeting_words):
             return "greeting"
         
         sql_keywords = ['show', 'list', 'display', 'find', 'get', 'count', 'how many', 'what are', 'which', 'select']
@@ -502,17 +534,35 @@ class WorkflowAgent:
         
         return "general_question"
     
-    def _fix_query(self, failed_query: str, error: str, user_query: str) -> Optional[str]:
-        """Attempt to fix a failed SQL query."""
+    def _fix_query(self, failed_query: str, error: str, user_query: str, schema_info: Optional[Dict] = None) -> Optional[str]:
+        """Attempt to fix a failed SQL query. Sends full error and generated SQL to LLM with schema context."""
         try:
-            fix_prompt = f"""The following SQL query failed with error: {error}
+            schema_context = ""
+            if schema_info and schema_info.get("tables"):
+                schema_context = "\n\nDatabase schema (use exact table/column names):\n"
+                for t in schema_info["tables"][:15]:
+                    sn = t.get("schema_name", "public")
+                    tbl = f'"{sn}".{t["name"]}' if sn != "public" else t["name"]
+                    cols = ", ".join(c["name"] for c in t.get("columns", [])[:8])
+                    schema_context += f"- {tbl}({cols})\n"
 
-Failed Query:
+            fix_prompt = f"""You are a SQL expert. A PostgreSQL query failed during execution. Fix it.
+
+**Error message from database:**
+{error or "Unknown error"}
+
+**Failed SQL query:**
 {failed_query}
 
-User's original question: {user_query}
+**User's question:**
+{user_query}
+{schema_context}
 
-Please generate a corrected SQL query that fixes the error. Only return the corrected SQL query, nothing else. Make sure it's a valid PostgreSQL SELECT query."""
+Instructions:
+1. Analyze the error - it may be: column doesn't exist, table doesn't exist, wrong schema, syntax error, type mismatch
+2. Generate a corrected PostgreSQL SELECT query
+3. Use exact table and column names from the schema above
+4. Return ONLY the corrected SQL query, no explanations or markdown"""
             
             response = ollama.generate(
                 model=self.sql_generator.model_name,

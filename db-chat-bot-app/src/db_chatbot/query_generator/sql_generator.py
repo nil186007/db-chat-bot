@@ -1,6 +1,7 @@
 """
 SQL query generation using local LLM (Ollama).
 """
+import re
 import ollama
 import json
 from typing import Optional, Dict, List
@@ -89,7 +90,9 @@ class SQLGenerator:
         schema_text = "Database Schema:\n\n"
         
         for table in schema_info["tables"]:
-            schema_text += f"Table: {table['name']}\n"
+            schema_name = table.get("schema_name", "public")
+            table_label = f'"{schema_name}".{table["name"]}' if schema_name != "public" else table["name"]
+            schema_text += f"Table: {table_label}\n"
             schema_text += "Columns:\n"
             
             for col in table["columns"]:
@@ -101,17 +104,67 @@ class SQLGenerator:
             if table["primary_keys"]:
                 schema_text += f"Primary Keys: {', '.join(table['primary_keys'])}\n"
             
-            if table["foreign_keys"]:
+            if table.get("foreign_keys"):
                 schema_text += "Foreign Keys:\n"
                 for fk in table["foreign_keys"]:
-                    schema_text += f"  - {fk['column']} -> {fk['references_table']}.{fk['references_column']}\n"
+                    ref_schema = fk.get("references_schema")
+                    ref_table = f'"{ref_schema}".{fk["references_table"]}' if ref_schema and ref_schema != "public" else fk["references_table"]
+                    schema_text += f"  - {fk['column']} -> {ref_table}.{fk['references_column']}\n"
             
             schema_text += "\n"
         
         logger.debug(f"Schema formatted: {len(schema_text)} characters")
         return schema_text
-    
-    def generate_sql(self, natural_language_query: str, schema_info: Dict, conversation_history: list = None, enhanced_context: str = None) -> Optional[str]:
+
+    def _qualify_schema_in_sql(self, sql_query: str, schema_info: Dict) -> str:
+        """
+        Post-process SQL to add schema qualification for tables not in 'public'.
+        Replaces unqualified table references (FROM/JOIN/comma) with "schema".table.
+        """
+        if not schema_info or not schema_info.get("tables"):
+            return sql_query
+        tables_to_qualify = [
+            (t["name"], t["schema_name"])
+            for t in schema_info["tables"]
+            if t.get("schema_name") and t["schema_name"] != "public"
+        ]
+        if not tables_to_qualify:
+            return sql_query
+        for table_name, schema_name in sorted(tables_to_qualify, key=lambda x: -len(x[0])):
+            escaped = re.escape(table_name)
+            qualified = f'"{schema_name}".{table_name}'
+            sql_query = re.sub(
+                rf"(\bFROM\s+)(?<!\.){escaped}\b",
+                r"\1" + qualified,
+                sql_query,
+                flags=re.IGNORECASE
+            )
+            for kw in ["JOIN", "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "CROSS JOIN",
+                       "LEFT OUTER JOIN", "RIGHT OUTER JOIN"]:
+                kw_pat = kw.replace(" ", r"\s+")
+                sql_query = re.sub(
+                    rf"(\b{kw_pat}\s+)(?<!\.){escaped}\b",
+                    r"\1" + qualified,
+                    sql_query,
+                    flags=re.IGNORECASE
+                )
+            sql_query = re.sub(
+                rf"(,\s*)(?<!\.){escaped}\b",
+                ", " + qualified,
+                sql_query,
+                flags=re.IGNORECASE
+            )
+        logger.debug(f"Schema-qualified SQL: {sql_query[:80]}...")
+        return sql_query
+
+    def generate_sql(
+        self,
+        natural_language_query: str,
+        schema_info: Dict,
+        conversation_history: list = None,
+        enhanced_context: str = None,
+        query_examples: list = None
+    ) -> Optional[str]:
         """
         Generate SQL query from natural language.
         
@@ -120,6 +173,7 @@ class SQLGenerator:
             schema_info: Database schema information (from RAG)
             conversation_history: Previous conversation messages for context
             enhanced_context: Enhanced schema context from knowledge graph (includes annotations)
+            query_examples: List of {natural_language, sql_query} from graph - use/adapt when user query matches
         
         Returns:
             Generated SQL query string or None if generation fails
@@ -132,6 +186,16 @@ class SQLGenerator:
             logger.debug("Using enhanced context from knowledge graph")
         else:
             schema_text = self.format_schema_for_prompt(schema_info)
+        
+        # Build query examples section - use matching examples to guide SQL generation
+        examples_text = ""
+        if query_examples and len(query_examples) > 0:
+            examples_text = "\n\nQuery Examples (use or adapt when user question matches):\n"
+            for i, ex in enumerate(query_examples[:5], 1):
+                nl = ex.get("natural_language", "")
+                sql = ex.get("sql_query", "")
+                if sql:
+                    examples_text += f"{i}. \"{nl}\" → {sql}\n"
         
         # Build conversation context
         context = ""
@@ -148,6 +212,7 @@ class SQLGenerator:
 IMPORTANT: You must ONLY generate SELECT queries. Do not generate INSERT, UPDATE, DELETE, DROP, or any other type of query.
 
 {schema_text}
+{examples_text}
 
 {context}
 
@@ -158,8 +223,10 @@ Instructions:
 2. Do not include any explanations, markdown formatting, or additional text
 3. Use proper SQL syntax for PostgreSQL
 4. Make sure to use correct table and column names from the schema
-5. Only SELECT statements are allowed - no data manipulation
-6. If the question is unclear or cannot be answered with the given schema, return "ERROR: [explanation]"
+5. If Query Examples are provided and your question matches one, adapt that example's SQL rather than generating from scratch
+5. SCHEMA QUALIFICATION: When tables are shown with a schema prefix (e.g., "schema_name".table_name), use them EXACTLY in your SQL. Always qualify table names with schema when the schema is not "public" (e.g., SELECT * FROM "sql-e-commerce".products).
+6. Only SELECT statements are allowed - no data manipulation
+7. If the question is unclear or cannot be answered with the given schema, return "ERROR: [explanation]"
 
 SQL Query:"""
 
@@ -192,7 +259,10 @@ SQL Query:"""
             if sql_query.startswith("ERROR:"):
                 logger.warning(f"LLM returned error: {sql_query}")
                 return None
-            
+
+            # Post-process: add schema qualification for tables not in public
+            sql_query = self._qualify_schema_in_sql(sql_query, schema_info)
+
             logger.info(f"SQL query generated successfully: {sql_query[:50]}...")
             return sql_query
             

@@ -20,17 +20,52 @@ class InputGuardrails:
         'CREATE', 'GRANT', 'REVOKE', 'EXEC', 'EXECUTE', 'CALL'
     }
     
-    # SQL injection patterns
+    # SQL injection patterns (order matters: more specific first)
     SQL_INJECTION_PATTERNS = [
-        r'--',  # SQL comment
-        r'/\*.*?\*/',  # Multi-line comment
-        r'union.*select',  # Union injection
-        r';.*DROP',  # Multiple statements with DROP
-        r';.*DELETE',  # Multiple statements with DELETE
+        r'--',  # SQL comment (e.g. '' OR 1=1; --)
+        r'/\*',  # Multi-line comment start
+        r'\*/',  # Multi-line comment end
+        r'#(?:\s|$)',  # MySQL/Unix line comment
+        r'union\s+.*\s+select',  # Union injection
+        r';\s*[-/#\w]',  # Multiple statements (semicolon followed by anything)
+        r';\s*--',  # Semicolon then comment (e.g. ; --)
+        r'\bor\s+1\s*=\s*1\b',  # OR 1=1 injection
+        r"\'\s*or\s+1\s*=\s*1",  # ' OR 1=1 (after empty string)
+        r"\'\s*or\s*\'1\'\s*=\s*\'1",  # ' OR '1'='1
+        r'"\s*or\s+1\s*=\s*1',  # " OR 1=1
+        r"=\s*'\s*'\s*or\s+1",  # = '' OR 1 (empty string then OR 1=1)
         r'xp_',  # SQL Server extended procedures
         r'sp_',  # SQL Server stored procedures
         r'exec\s*\(',  # Execution
-        r'0x[0-9a-f]+',  # Hex encoded strings
+        r'\bexec\b',  # EXEC keyword
+        r'0x[0-9a-fA-F]+',  # Hex encoded strings
+        r'\bwaitfor\b',  # SQL Server WAITFOR
+        r'\bpg_sleep\s*\(',  # PostgreSQL sleep (injection test)
+        r'\bsleep\s*\(',  # Sleep function
+        r'\bbenchmark\s*\(',  # MySQL benchmark
+        r'insert\s+into\s+.*\bselect\b',  # INSERT...SELECT injection
+        r'\binto\s+outfile\b',  # MySQL file export
+        r'\binto\s+dumpfile\b',  # MySQL dump
+        r"\bor\s+'\s*'\s*=\s*'\s*'",  # OR ''='' (always-true variant)
+        r'\band\s+1\s*=\s*1\b',  # AND 1=1 injection
+        r'\bhaving\s+1\s*=\s*1\b',  # HAVING 1=1
+    ]
+
+    # User intent keywords that indicate forbidden operations (reject before SQL generation)
+    # Use specific patterns to avoid false positives (e.g. "create table of contents")
+    DANGEROUS_INTENT_PATTERNS = [
+        r'\bdelete\s+(from|all|everything|the\s+data|all\s+rows?|all\s+records?)\b',
+        r'\bdelete\s+from\s+\w+',  # delete from <table>
+        r'\bdrop\s+(table|database|schema|view)\s+\w+',
+        r'\btruncate\s+table\b',
+        r'\binsert\s+into\s+\w+',
+        r'\bupdate\s+\w+\s+set\s+',  # update X set 
+        r'\balter\s+table\s+\w+',
+        r'\bcreate\s+table\s+\w+',  # create table X (avoids "table of contents")
+        r'\bgrant\s+',
+        r'\brevoke\s+',
+        r'\bremove\s+(all\s+)?data\s+from\b',
+        r'\bclear\s+(the\s+)?(table|data)\b',
     ]
     
     @staticmethod
@@ -126,6 +161,67 @@ class InputGuardrails:
         logger.debug("No SQL injection patterns detected")
         return True, None
     
+    @staticmethod
+    def is_security_violation(error_message: str) -> bool:
+        """
+        Check if a validation error is a security violation (forbidden ops, SQL injection).
+        Security violations should NOT be retried/fixed - they must be rejected.
+        """
+        if not error_message:
+            return False
+        err_lower = error_message.lower()
+        security_indicators = [
+            "forbidden", "not allowed", "only select", "security violation",
+            "sql injection", "multiple sql statements"
+        ]
+        return any(ind in err_lower for ind in security_indicators)
+
+    @staticmethod
+    def validate_user_input(user_query: str) -> Tuple[bool, Optional[str]]:
+        """
+        Validate raw user input for dangerous intent and SQL injection before processing.
+        Rejects requests for delete/drop/update etc. and obvious injection attempts.
+        
+        Returns:
+            Tuple of (is_safe: bool, error_message: str or None)
+        """
+        if not user_query or not user_query.strip():
+            return True, None
+        query_lower = user_query.lower().strip()
+        query_upper = user_query.upper()
+
+        # Check for dangerous intent (natural language)
+        for pattern in InputGuardrails.DANGEROUS_INTENT_PATTERNS:
+            if re.search(pattern, query_lower, re.IGNORECASE):
+                logger.warning(f"Dangerous intent detected in user input: {pattern}")
+                return False, (
+                    "This type of operation is not allowed. "
+                    "Only read-only SELECT queries are permitted. "
+                    "For data modifications, please use your database client directly."
+                )
+
+        # Check for raw SQL in user input (possible injection)
+        raw_sql_indicators = [
+            (r'\b(delete|drop|truncate|insert|update)\s+', "Raw SQL with write operation detected."),
+            (r';\s*\S', "Multiple statements detected - not allowed."),
+            (r';\s*--', "SQL comment after semicolon detected - possible injection."),
+            (r'\s--\s', "SQL comment pattern detected in input."),
+            (r'\bor\s+1\s*=\s*1\b', "SQL injection pattern (OR 1=1) detected."),
+            (r"'\s*or\s+1\s*=\s*1", "SQL injection pattern (' OR 1=1) detected."),
+            (r"=\s*'\s*'\s*or\s+1", "SQL injection pattern (= '' OR 1=1) detected."),
+            (r'union\s+.*select', "Union-based injection pattern detected."),
+            (r'/\*', "SQL comment detected."),
+        ]
+        for pattern, msg in raw_sql_indicators:
+            if re.search(pattern, query_upper, re.IGNORECASE):
+                logger.warning(f"Potential SQL injection in user input: {pattern}")
+                return False, (
+                    "Security violation: Your input contains patterns that are not allowed. "
+                    "Please rephrase your question in natural language."
+                )
+
+        return True, None
+
     @staticmethod
     def validate_query(query: str) -> Tuple[bool, Optional[str]]:
         """

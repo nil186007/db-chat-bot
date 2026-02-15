@@ -1,5 +1,6 @@
 """
-Streamlit-based PostgreSQL chatbot with natural language to SQL conversion.
+Streamlit-based SQL database chatbot with natural language to SQL conversion.
+Supports PostgreSQL and other SQL database flavors (MongoDB removed).
 """
 import sys
 from pathlib import Path
@@ -13,10 +14,8 @@ import streamlit as st
 import pandas as pd
 import json
 from db_chatbot.db_clients.postgres_client import PostgresClient
-from db_chatbot.db_clients.mongodb_client import MongoDBClient
 from db_chatbot.db_clients.neo4j_client import Neo4jClient
 from db_chatbot.query_generator.sql_generator import SQLGenerator
-from db_chatbot.query_generator.mongodb_query_generator import MongoDBQueryGenerator
 from db_chatbot.query_generator.response_generator import ResponseGenerator
 from db_chatbot.query_intent.classifier import QueryClassifier
 from db_chatbot.rag.schema_rag import SchemaRAG
@@ -26,8 +25,9 @@ from db_chatbot.handlers.query_example_handler import QueryExampleHandler
 from db_chatbot.handlers.database_type_handler import DatabaseTypeHandler
 from db_chatbot.handlers.schema_query_handler import SchemaQueryHandler
 from db_chatbot.agents.workflow_agent import WorkflowAgent
-from db_chatbot.agents.mongodb_workflow_agent import MongoDBWorkflowAgent
 from db_chatbot.agents.orchestrator_agent import OrchestratorAgent
+from db_chatbot.guardrails.input_guardrails import InputGuardrails
+from db_chatbot.guardrails.output_guardrails import OutputGuardrails
 from db_chatbot.query_intent.database_router import DatabaseRouter
 from db_chatbot.query_intent.unified_intent_classifier import UnifiedIntentClassifier
 from db_chatbot.config.settings import get_logger
@@ -44,16 +44,12 @@ st.set_page_config(
 # Initialize session state
 if "db_client" not in st.session_state:
     st.session_state.db_client = PostgresClient()
-    st.session_state.mongodb_client = MongoDBClient()
     st.session_state.neo4j_client = Neo4jClient()
     st.session_state.neo4j_connected = False
     st.session_state.neo4j_auto_connect_attempted = False
     st.session_state.connected = False
-    st.session_state.mongodb_connected = False
     st.session_state.schema_loaded = False
-    st.session_state.mongodb_schema_loaded = False
     st.session_state.sql_generator = None
-    st.session_state.mongodb_query_generator = None
     st.session_state.messages = []
     # Initialize handlers without model initially (will be updated when model loads)
     st.session_state.annotation_handler = AnnotationHandler(model_name=None)
@@ -63,14 +59,12 @@ if "db_client" not in st.session_state:
     st.session_state.unified_intent_classifier = None  # Will be initialized when model loads
     # Initialize SchemaRAG without KnowledgeGraphRAG initially
     st.session_state.schema_rag = SchemaRAG()
+    # Last 3 user queries (DB_QUERY type only) for quick reference
+    st.session_state.recent_user_queries = []
     # PostgreSQL connection info
     st.session_state.postgres_db_name = None
     st.session_state.postgres_db_host = None
     st.session_state.postgres_db_port = None
-    # MongoDB connection info
-    st.session_state.mongodb_db_name = None
-    st.session_state.mongodb_db_host = None
-    st.session_state.mongodb_db_port = None
     logger.info("Session state initialized")
 
 if "response_generator" not in st.session_state:
@@ -83,10 +77,97 @@ if "query_classifier" not in st.session_state:
 
 if "workflow_agent" not in st.session_state:
     st.session_state.workflow_agent = None
-    st.session_state.mongodb_workflow_agent = None
     st.session_state.orchestrator_agent = None
     st.session_state.database_router = None
     logger.debug("WorkflowAgent placeholder initialized")
+
+
+def _normalize_workflow_steps(steps: list) -> list:
+    """
+    Deduplicate and renumber workflow steps for proper display.
+    - Removes duplicate entries (same step num + name; keeps last/final state)
+    - Assigns sequential display numbers 1, 2, 3...
+    """
+    if not steps:
+        return []
+    seen = {}
+    last_index = {}
+    for i, s in enumerate(steps):
+        key = (s.get("step"), s.get("name", ""))
+        seen[key] = dict(s)
+        last_index[key] = i
+    ordered = sorted(seen.items(), key=lambda x: last_index.get(x[0], 0))
+    result = []
+    for i, (_, s) in enumerate(ordered, 1):
+        s["_display_num"] = i
+        result.append(s)
+    return result
+
+
+def _render_result_with_chart_option(df: pd.DataFrame, key_prefix: str = ""):
+    """Display dataframe with Table/Chart view toggle. Masks sensitive data before display."""
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return
+    df = OutputGuardrails.mask_sensitive_dataframe(df.copy())
+    view_mode = st.radio(
+        "View as",
+        options=["Table", "Chart"],
+        key=f"view_mode_{key_prefix}",
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+    if view_mode == "Table":
+        st.dataframe(df, use_container_width=True)
+    else:
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        all_cols = list(df.columns)
+        if not numeric_cols:
+            st.info("No numeric columns to chart. Showing table instead.")
+            st.dataframe(df, use_container_width=True)
+            return
+        chart_type = st.selectbox(
+            "Chart type",
+            ["Bar", "Line", "Area", "Pie"],
+            key=f"chart_type_{key_prefix}",
+            label_visibility="collapsed"
+        )
+        x_options = ["(First column)"] + all_cols
+        x_col = st.selectbox(
+            "X-axis / Labels",
+            options=x_options,
+            key=f"x_col_{key_prefix}",
+            index=0
+        )
+        y_col = st.selectbox(
+            "Y-axis / Values",
+            options=numeric_cols,
+            key=f"y_col_{key_prefix}",
+            index=0
+        )
+        chart_df = df.head(50).copy()
+        x_use = chart_df.columns[0] if x_col == "(First column)" else x_col
+        try:
+            if chart_type in ("Bar", "Line", "Area"):
+                plot_df = chart_df[[x_use, y_col]].set_index(x_use)
+                if chart_type == "Bar":
+                    st.bar_chart(plot_df)
+                elif chart_type == "Line":
+                    st.line_chart(plot_df)
+                else:
+                    st.area_chart(plot_df)
+            else:  # Pie
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(8, 6))
+                pie_data = chart_df.head(20)
+                labels = [str(v)[:30] for v in pie_data[x_use]]  # Truncate long labels
+                vals = pie_data[y_col]
+                ax.pie(vals, labels=labels, autopct="%1.1f%%", startangle=90)
+                ax.axis("equal")
+                st.pyplot(fig)
+                plt.close()
+        except Exception as e:
+            st.warning(f"Could not render chart: {e}")
+            st.dataframe(df, use_container_width=True)
 
 
 def reset_postgres_connection():
@@ -101,23 +182,10 @@ def reset_postgres_connection():
     st.session_state.postgres_db_port = None
     st.session_state.workflow_agent = None
 
-def reset_mongodb_connection():
-    """Reset MongoDB connection and related state."""
-    logger.info("Resetting MongoDB connection")
-    if st.session_state.mongodb_client:
-        st.session_state.mongodb_client.close()
-    st.session_state.mongodb_connected = False
-    st.session_state.mongodb_schema_loaded = False
-    st.session_state.mongodb_db_name = None
-    st.session_state.mongodb_db_host = None
-    st.session_state.mongodb_db_port = None
-    st.session_state.mongodb_workflow_agent = None
-
-
 def main():
     logger.info("Starting main application")
     st.title("🗄️ Database ChatBot")
-    st.markdown("Connect to PostgreSQL or MongoDB and query your database using natural language!")
+    st.markdown("Connect to your SQL database (PostgreSQL) and query using natural language!")
     
     # Auto-connect to Neo4j on startup (silent, no UI)
     if not st.session_state.neo4j_connected and not st.session_state.neo4j_auto_connect_attempted:
@@ -148,6 +216,13 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
+        # Recent queries section
+        recent = getattr(st.session_state, "recent_user_queries", [])
+        if recent:
+            with st.expander("📝 Last 3 Queries", expanded=False):
+                for i, q in enumerate(reversed(recent), 1):
+                    st.caption(f"{i}. {q[:60]}{'...' if len(q) > 60 else ''}")
+                    st.code(q, language=None)
         st.divider()
         
         # PostgreSQL connection section
@@ -216,77 +291,6 @@ def main():
         
         st.divider()
         
-        # MongoDB connection section
-        st.subheader("🍃 MongoDB Connection")
-        
-        # Show connection status
-        if st.session_state.mongodb_connected:
-            st.success(f"✅ Connected to {st.session_state.mongodb_db_name or 'MongoDB'}")
-            if st.button("Disconnect MongoDB", use_container_width=True, key="disconnect_mongo"):
-                reset_mongodb_connection()
-                st.rerun()
-        else:
-            with st.form("mongodb_connection_form"):
-                mongo_host = st.text_input("Host", value="localhost", key="mongo_host")
-                mongo_port = st.number_input("Port", value=27017, min_value=1, max_value=65535, key="mongo_port")
-                mongo_db = st.text_input("Database", value="vendor_supply_chain_db", key="mongo_db")
-                mongo_user = st.text_input("Username (optional)", value="", key="mongo_user")
-                mongo_password = st.text_input("Password (optional)", type="password", value="", key="mongo_password")
-                
-                connect_button = st.form_submit_button("Connect to MongoDB", use_container_width=True)
-            
-            if connect_button:
-                logger.info(f"MongoDB connection attempt: {mongo_host}:{mongo_port}/{mongo_db}")
-                with st.spinner("Connecting to MongoDB..."):
-                    success, message = st.session_state.mongodb_client.connect(
-                        host=mongo_host,
-                        port=int(mongo_port),
-                        database=mongo_db,
-                        username=mongo_user if mongo_user else None,
-                        password=mongo_password if mongo_password else None
-                    )
-                    
-                    if success:
-                        st.session_state.mongodb_connected = True
-                        st.success(message)
-                        logger.info("MongoDB connection successful")
-                        
-                        # Store connection info
-                        st.session_state.mongodb_db_name = mongo_db
-                        st.session_state.mongodb_db_host = mongo_host
-                        st.session_state.mongodb_db_port = int(mongo_port)
-                        
-                        # Fetch schema and load into knowledge graph
-                        with st.spinner("Loading MongoDB schema into knowledge graph..."):
-                            logger.info("Starting MongoDB schema fetch")
-                            schema = st.session_state.mongodb_client.fetch_schema()
-                            if schema:
-                                # Build knowledge graph from MongoDB schema
-                                if st.session_state.neo4j_connected and st.session_state.schema_rag.knowledge_graph_rag:
-                                    st.session_state.schema_rag.knowledge_graph_rag.build_graph_from_schema(
-                                        schema,
-                                        database_name=mongo_db,
-                                        host=mongo_host,
-                                        port=int(mongo_port),
-                                        db_type="mongodb"
-                                    )
-                                    st.success(f"Loaded {len(schema['collections'])} collection(s) into Knowledge Graph")
-                                    logger.info(f"MongoDB schema loaded into knowledge graph: {len(schema['collections'])} collections")
-                                else:
-                                    st.warning("Neo4j not connected. Schema will not be stored in knowledge graph.")
-                                    logger.warning("MongoDB schema fetched but not stored (Neo4j not connected)")
-                                
-                                st.session_state.mongodb_schema_loaded = True
-                            else:
-                                st.error("Failed to load MongoDB schema")
-                                logger.error("MongoDB schema loading failed")
-                    else:
-                        st.error(message)
-                        st.session_state.mongodb_connected = False
-                        logger.error(f"MongoDB connection failed: {message}")
-        
-        st.divider()
-        
         # LLM Model selection
         st.subheader("LLM Settings")
         
@@ -315,7 +319,6 @@ def main():
             try:
                 logger.info(f"Loading model: {selected_model}")
                 st.session_state.sql_generator = SQLGenerator(model_name=selected_model)
-                st.session_state.mongodb_query_generator = MongoDBQueryGenerator(model_name=selected_model)
                 # Initialize response generator with the same model
                 st.session_state.response_generator = ResponseGenerator(model_name=selected_model)
                 # Initialize unified intent classifier (most important component)
@@ -336,7 +339,6 @@ def main():
                 st.session_state.schema_query_handler = SchemaQueryHandler(model_name=selected_model)
                 # Reset workflow agents and orchestrator - will be initialized when needed
                 st.session_state.workflow_agent = None
-                st.session_state.mongodb_workflow_agent = None
                 st.session_state.orchestrator_agent = None
                 st.success(f"Loaded model: {selected_model}")
                 logger.info(f"Model {selected_model} loaded successfully")
@@ -347,43 +349,105 @@ def main():
         # Show current model
         if st.session_state.sql_generator:
             st.info(f"📌 Current model: {st.session_state.sql_generator.model_name}")
-        elif st.session_state.mongodb_query_generator:
-            st.info(f"📌 Current model: {st.session_state.mongodb_query_generator.model_name}")
+        
+        # Schema Explorer & Query Examples (when connected and schema loaded)
+        if st.session_state.connected and st.session_state.schema_loaded and st.session_state.schema_rag.knowledge_graph_rag:
+            st.divider()
+            with st.expander("📋 Schema & Examples", expanded=False):
+                kg = st.session_state.schema_rag.knowledge_graph_rag
+                db_name = st.session_state.postgres_db_name
+                tables = kg.get_tables_for_database(db_name) if db_name else []
+                
+                if tables:
+                    for tbl in tables:
+                        schema_name = tbl.get("schema_name", "public")
+                        table_label = f'"{schema_name}".{tbl["name"]}' if schema_name != "public" else tbl["name"]
+                        with st.expander(f"📁 {table_label}", expanded=False):
+                            # Table description/context
+                            existing_desc = kg.get_annotation("table", tbl["name"], database_name=db_name, schema_name=schema_name)
+                            new_desc = st.text_area(
+                                "Table context/description",
+                                value=existing_desc or "",
+                                key=f"tbl_desc_{tbl['name']}_{schema_name}",
+                                placeholder="e.g., Contains product catalog with name, price, category"
+                            )
+                            if st.button("Save table context", key=f"save_tbl_{tbl['name']}"):
+                                kg.add_annotation("table", tbl["name"], content=new_desc, database_name=db_name, schema_name=schema_name)
+                                st.success("Saved!")
+                                st.rerun()
+                            
+                            # Columns with context
+                            columns = kg.get_columns_for_table(tbl["name"], db_name, schema_name)
+                            for col in columns:
+                                col_ann = kg.get_annotation("column", col["name"], table_name=tbl["name"], database_name=db_name, schema_name=schema_name)
+                                with st.expander(f"  📌 {col['name']} ({col.get('type', '')})", expanded=False):
+                                    col_ctx = st.text_area("Column context", value=col_ann or "", key=f"col_{tbl['name']}_{col['name']}", placeholder="e.g., Unique product identifier")
+                                    if st.button("Save", key=f"save_col_{tbl['name']}_{col['name']}"):
+                                        kg.add_annotation("column", col["name"], col_ctx, table_name=tbl["name"], database_name=db_name, schema_name=schema_name)
+                                        st.rerun()
+                            
+                            # Query examples for this table
+                            examples = kg.get_query_examples_for_table(tbl["name"], db_name, schema_name)
+                            if examples:
+                                st.caption("Query examples:")
+                                for ex in examples[:3]:
+                                    st.code(ex.get("sql_query", ""), language="sql")
+                            
+                            # Add query example form
+                            st.divider()
+                            with st.form(f"add_example_{tbl['name']}"):
+                                st.caption("Add query example")
+                                ex_nl = st.text_input("Natural language (what does this query do?)", key=f"ex_nl_{tbl['name']}", placeholder="e.g., show all products")
+                                ex_sql = st.text_area("SQL query", key=f"ex_sql_{tbl['name']}", placeholder="SELECT * FROM ...")
+                                if st.form_submit_button("Save example"):
+                                    if ex_sql.strip() and ex_nl.strip():
+                                        try:
+                                            kg.add_query_example(
+                                                entity_type="table",
+                                                entity_name=tbl["name"],
+                                                query=ex_sql.strip(),
+                                                natural_language=ex_nl.strip(),
+                                                table_name=tbl["name"],
+                                                schema_name=schema_name,
+                                                database_name=db_name
+                                            )
+                                            st.success("Example saved!")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(str(e))
+                                    else:
+                                        st.warning("Enter both natural language and SQL")
+                else:
+                    st.caption("No tables in graph. Load schema first.")
         
         # Info about metadata management via chat
         st.divider()
         st.info("💡 **Tip:** Provide metadata by chatting with the bot:\n\n"
                 "**Database descriptions:**\n"
-                "- 'PostgreSQL stores: products, orders, customers, sales data'\n"
-                "- 'MongoDB contains: vendors, inventory, shipments, purchase orders'\n\n"
-                "**Table/Collection descriptions:**\n"
-                "- 'The products table contains: product information, pricing, inventory levels'\n"
-                "- 'The vendors collection stores: supplier details, contact information'\n\n"
-                "**Column/Field descriptions:**\n"
-                "- 'The product_id column is: unique identifier for each product'\n"
-                "- 'The vendor_name field contains: name of the supplier or vendor'")
+                "- 'PostgreSQL stores: products, orders, customers, sales data'\n\n"
+                "**Table descriptions:**\n"
+                "- 'The products table contains: product information, pricing, inventory levels'\n\n"
+                "**Column descriptions:**\n"
+                "- 'The product_id column is: unique identifier for each product'")
     
     # Main chat interface
-    if not st.session_state.connected and not st.session_state.mongodb_connected:
-        st.info("👈 Please connect to at least one database (PostgreSQL or MongoDB) using the sidebar to get started.")
+    if not st.session_state.connected:
+        st.info("👈 Please connect to your SQL database (PostgreSQL) using the sidebar to get started.")
         st.markdown("""
         ### How to use:
-        1. Enter your database connection details in the sidebar (PostgreSQL and/or MongoDB)
-        2. Click "Connect" for each database you want to use
-        3. Wait for the schema(s) to load
+        1. Enter your database connection details in the sidebar
+        2. Click "Connect to PostgreSQL"
+        3. Wait for the schema to load
         4. Select and load an LLM model
-        5. Start asking questions about your database(s)!
-        
-        **Note:** You can connect to both PostgreSQL and MongoDB simultaneously. The system will automatically route your queries to the appropriate database.
+        5. Start asking questions about your database!
         """)
         return
     
-    if (st.session_state.connected and not st.session_state.schema_loaded) or \
-       (st.session_state.mongodb_connected and not st.session_state.mongodb_schema_loaded):
-        st.warning("⚠️ Schema not fully loaded. Please check your connection(s).")
+    if st.session_state.connected and not st.session_state.schema_loaded:
+        st.warning("⚠️ Schema not fully loaded. Please check your connection.")
         return
     
-    if st.session_state.sql_generator is None and st.session_state.mongodb_query_generator is None:
+    if st.session_state.sql_generator is None:
         st.warning("⚠️ Please load an LLM model from the sidebar to generate queries.")
     
     # Display chat messages
@@ -399,18 +463,19 @@ def main():
             # Show workflow steps if available
             if message.get("steps"):
                 with st.expander("🔄 View Workflow Steps", expanded=False):
-                    for step in message["steps"]:
+                    for step in _normalize_workflow_steps(message["steps"]):
                         step_status = step.get("status", "pending")
                         step_icon = "✅" if step_status == "completed" else "❌" if step_status == "error" else "⏳"
                         status_color = "green" if step_status == "completed" else "red" if step_status == "error" else "blue"
                         
                         step_name = step.get('name', '')
+                        display_num = step.get("_display_num", step.get("step", 0))
                         is_retry = 'retry' in step_name.lower() or 'fix' in step_name.lower() or 'fixed' in step_name.lower()
                         is_sql_gen = 'sql generation' in step_name.lower()
                         is_fix_attempt = 'query fix' in step_name.lower() and step_status == "in_progress"
                         is_fixed = 'query fixed' in step_name.lower()
                         
-                        st.markdown(f"{step_icon} **Step {step.get('step')}: {step_name}**")
+                        st.markdown(f"{step_icon} **Step {display_num}: {step_name}**")
                         st.markdown(f"  Status: :{status_color}[{step_status}] - {step.get('message', '')}")
                         
                         # Show error if present
@@ -432,11 +497,11 @@ def main():
                                 st.markdown("  **SQL Query:**")
                                 st.code(step.get('sql_query'), language="sql")
             
-            # Show query results if available
+            # Show query results if available (with chart option)
             if message.get("query_results") is not None:
                 df = message.get("query_results")
                 if isinstance(df, pd.DataFrame) and len(df) > 0:
-                    st.dataframe(df, use_container_width=True)
+                    _render_result_with_chart_option(df, key_prefix=f"msg_{idx}")
     
     # Chat input
     if prompt := st.chat_input("Ask a question about your database..."):
@@ -449,8 +514,19 @@ def main():
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
         with st.chat_message("assistant"):
+            # Early guardrail: reject dangerous intents and SQL injection in user input
+            is_safe, guardrail_error = InputGuardrails.validate_user_input(prompt)
+            if not is_safe:
+                st.error(f"⛔ **Not allowed**\n\n{guardrail_error}")
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": f"⛔ **Not allowed**\n\n{guardrail_error}"
+                })
+                st.rerun()
+                return
+
             # Use unified intent classifier if available (most important step)
             if st.session_state.unified_intent_classifier:
                 logger.info("Using unified intent classifier")
@@ -477,7 +553,7 @@ def main():
                                 if databases:
                                     response_parts.append("## 📊 Connected Databases\n\n")
                                     for db in databases:
-                                        db_type_icon = "🐘" if db["type"] == "postgresql" else "🍃" if db["type"] == "mongodb" else "💾"
+                                        db_type_icon = "🐘" if db["type"] == "postgresql" else "💾"
                                         response_parts.append(f"### {db_type_icon} {db['name']} ({db['type'].upper()})")
                                         response_parts.append(f"- **Host:** {db.get('host', 'N/A')}")
                                         response_parts.append(f"- **Port:** {db.get('port', 'N/A')}")
@@ -497,7 +573,9 @@ def main():
                                             if tables:
                                                 response_parts.append(f"## 📋 Tables in {db['name']} (PostgreSQL)\n\n")
                                                 for table in tables:
-                                                    response_parts.append(f"### {table['name']}")
+                                                    schema_name = table.get("schema_name", "public")
+                                                    table_label = f'"{schema_name}".{table["name"]}' if schema_name != "public" else table["name"]
+                                                    response_parts.append(f"### {table_label}")
                                                     response_parts.append(f"- **Columns:** {table['column_count']}")
                                                     if table.get("description"):
                                                         response_parts.append(f"- **Description:** {table['description']}")
@@ -507,7 +585,9 @@ def main():
                                     if tables:
                                         response_parts.append(f"## 📋 Tables in {database_name}\n\n")
                                         for table in tables:
-                                            response_parts.append(f"### {table['name']}")
+                                            schema_name = table.get("schema_name", "public")
+                                            table_label = f'"{schema_name}".{table["name"]}' if schema_name != "public" else table["name"]
+                                            response_parts.append(f"### {table_label}")
                                             response_parts.append(f"- **Columns:** {table['column_count']}")
                                             if table.get("description"):
                                                 response_parts.append(f"- **Description:** {table['description']}")
@@ -526,52 +606,6 @@ def main():
                                             response_parts.append(f"- **Type:** {col.get('type', 'N/A')}{nullable_str}")
                                             if col.get("description"):
                                                 response_parts.append(f"- **Description:** {col['description']}")
-                                            response_parts.append("")
-                            
-                            elif query_type == "collections":
-                                database_name = details.get("database_name")
-                                if not database_name:
-                                    databases = [db for db in kg_rag.get_all_databases() if db["type"] == "mongodb"]
-                                    if databases:
-                                        for db in databases:
-                                            collections = kg_rag.get_collections_for_database(db["name"])
-                                            if collections:
-                                                response_parts.append(f"## 📦 Collections in {db['name']} (MongoDB)\n\n")
-                                                for coll in collections:
-                                                    response_parts.append(f"### {coll['name']}")
-                                                    response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
-                                                    response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
-                                                    if coll.get("description"):
-                                                        response_parts.append(f"- **Description:** {coll['description']}")
-                                                    response_parts.append("")
-                                else:
-                                    collections = kg_rag.get_collections_for_database(database_name)
-                                    if collections:
-                                        response_parts.append(f"## 📦 Collections in {database_name}\n\n")
-                                        for coll in collections:
-                                            response_parts.append(f"### {coll['name']}")
-                                            response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
-                                            response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
-                                            if coll.get("description"):
-                                                response_parts.append(f"- **Description:** {coll['description']}")
-                                            response_parts.append("")
-                            
-                            elif query_type == "fields":
-                                collection_name = details.get("collection_name")
-                                database_name = details.get("database_name") or st.session_state.mongodb_db_name
-                                if collection_name and database_name:
-                                    fields = kg_rag.get_fields_for_collection(collection_name, database_name)
-                                    if fields:
-                                        response_parts.append(f"## 📊 Fields in {collection_name} collection\n\n")
-                                        for field in fields:
-                                            types_str = ", ".join(field.get("types", [])) if isinstance(field.get("types"), list) else field.get("types", "N/A")
-                                            nullable_str = " (nullable)" if field.get("nullable") else " (not null)"
-                                            response_parts.append(f"### {field['name']}")
-                                            response_parts.append(f"- **Types:** {types_str}{nullable_str}")
-                                            if field.get("example"):
-                                                response_parts.append(f"- **Example:** {field['example']}")
-                                            if field.get("description"):
-                                                response_parts.append(f"- **Description:** {field['description']}")
                                             response_parts.append("")
                             
                             if response_parts:
@@ -609,7 +643,6 @@ def main():
                                     # Check if it's a database type description
                                     query_lower = prompt.lower()
                                     if "postgresql" in query_lower or "postgres" in query_lower:
-                                        # Update PostgreSQL database description
                                         db_type = "postgresql"
                                         database_name = st.session_state.postgres_db_name
                                         if database_name:
@@ -620,20 +653,8 @@ def main():
                                             response = f"✅ Database description saved for PostgreSQL:\n\n{content}"
                                         else:
                                             response = "⚠️ PostgreSQL database not connected. Please connect first."
-                                    elif "mongodb" in query_lower or "mongo" in query_lower:
-                                        # Update MongoDB database description
-                                        db_type = "mongodb"
-                                        database_name = st.session_state.mongodb_db_name
-                                        if database_name:
-                                            st.session_state.schema_rag.knowledge_graph_rag.update_database_type_description(
-                                                db_type=db_type,
-                                                description=content
-                                            )
-                                            response = f"✅ Database description saved for MongoDB:\n\n{content}"
-                                        else:
-                                            response = "⚠️ MongoDB database not connected. Please connect first."
                                     else:
-                                        response = "⚠️ Could not determine database type. Please specify PostgreSQL or MongoDB."
+                                        response = "⚠️ Could not determine database type. Please specify PostgreSQL."
                                     
                                     st.success(response)
                                     st.session_state.messages.append({
@@ -645,14 +666,11 @@ def main():
                                 
                                 # Handle regular metadata updates (tables, columns, collections, fields, specific databases)
                                 if entity_name:
-                                    # Determine database name
                                     database_name = None
                                     if entity_type in ["table", "column"]:
                                         database_name = st.session_state.postgres_db_name
-                                    elif entity_type in ["collection", "field"]:
-                                        database_name = st.session_state.mongodb_db_name
                                     elif entity_type == "database":
-                                        database_name = entity_name if entity_name else (st.session_state.postgres_db_name or st.session_state.mongodb_db_name)
+                                        database_name = entity_name if entity_name else st.session_state.postgres_db_name
                                     
                                     st.session_state.schema_rag.add_annotation(
                                         entity_type=entity_type,
@@ -663,11 +681,8 @@ def main():
                                     )
                                     
                                     entity_desc = f"{entity_type} '{entity_name}'"
-                                    if table_name:
-                                        if entity_type == "column":
-                                            entity_desc = f"column '{entity_name}' in table '{table_name}'"
-                                        elif entity_type == "field":
-                                            entity_desc = f"field '{entity_name}' in collection '{table_name}'"
+                                    if table_name and entity_type == "column":
+                                        entity_desc = f"column '{entity_name}' in table '{table_name}'"
                                     
                                     response = f"✅ Metadata saved for {entity_desc}:\n\n{content}"
                                     st.success(response)
@@ -680,7 +695,7 @@ def main():
                                     st.warning("Could not extract entity name from query.")
                                     st.session_state.messages.append({
                                         "role": "assistant",
-                                        "content": "Could not extract entity name. Please specify the entity (table, column, collection, field, or database name)."
+                                        "content": "Could not extract entity name. Please specify the entity (table, column, or database name)."
                                     })
                             else:
                                 st.warning("Could not extract metadata information from query.")
@@ -696,17 +711,16 @@ def main():
                 
                 elif intent == "GENERAL_QUESTION":
                     logger.info("Routing to GENERAL_QUESTION handler")
-                    # Handle general questions/greetings
                     greeting_responses = {
-                        "hello": "Hello! 👋 I'm your database assistant. How can I help you query your databases today?",
-                        "hi": "Hi! 👋 I can help you query your PostgreSQL and MongoDB databases, manage metadata, and explore schema information.",
-                        "help": "I can help you:\n- Query data from PostgreSQL and MongoDB\n- Add/update metadata for databases, tables, columns, collections, and fields\n- Explore schema information\n- Show connected databases and their structure\n\nTry asking: 'show all vendors', 'list tables', or 'add description to products table'"
+                        "hello": "Hello! 👋 I'm your SQL database assistant. How can I help you query your database today?",
+                        "hi": "Hi! 👋 I can help you query your SQL database, manage metadata, and explore schema information.",
+                        "help": "I can help you:\n- Query data from your SQL database\n- Add/update metadata for databases, tables, and columns\n- Explore schema information\n- Show connected databases and their structure\n\nTry asking: 'show all products', 'list tables', or 'add description to products table'"
                     }
                     
                     query_lower = prompt.lower().strip()
                     response = greeting_responses.get(query_lower, 
-                        "Hello! 👋 I'm your database assistant. I can help you:\n"
-                        "- Query data from your databases\n"
+                        "Hello! 👋 I'm your SQL database assistant. I can help you:\n"
+                        "- Query data from your database\n"
                         "- Manage metadata and descriptions\n"
                         "- Explore schema information\n\n"
                         "What would you like to do?")
@@ -739,7 +753,7 @@ def main():
                             if databases:
                                 response_parts.append("## 📊 Connected Databases\n\n")
                                 for db in databases:
-                                    db_type_icon = "🐘" if db["type"] == "postgresql" else "🍃" if db["type"] == "mongodb" else "💾"
+                                    db_type_icon = "🐘" if db["type"] == "postgresql" else "💾"
                                     response_parts.append(f"### {db_type_icon} {db['name']} ({db['type'].upper()})")
                                     response_parts.append(f"- **Host:** {db.get('host', 'N/A')}")
                                     response_parts.append(f"- **Port:** {db.get('port', 'N/A')}")
@@ -803,65 +817,6 @@ def main():
                             else:
                                 response_parts.append("Please specify a table name. Example: 'show columns in products table'")
                         
-                        elif schema_query["query_type"] == "collections":
-                            # Show collections for database(s)
-                            database_name = schema_query.get("database_name")
-                            
-                            # If database name not specified, show collections for all connected MongoDB databases
-                            if not database_name:
-                                databases = [db for db in kg_rag.get_all_databases() if db["type"] == "mongodb"]
-                                if databases:
-                                    for db in databases:
-                                        collections = kg_rag.get_collections_for_database(db["name"])
-                                        if collections:
-                                            response_parts.append(f"## 📦 Collections in {db['name']} (MongoDB)\n\n")
-                                            for coll in collections:
-                                                response_parts.append(f"### {coll['name']}")
-                                                response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
-                                                response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
-                                                if coll.get("description"):
-                                                    response_parts.append(f"- **Description:** {coll['description']}")
-                                                response_parts.append("")
-                                else:
-                                    response_parts.append("No MongoDB databases found.")
-                            else:
-                                collections = kg_rag.get_collections_for_database(database_name)
-                                if collections:
-                                    response_parts.append(f"## 📦 Collections in {database_name}\n\n")
-                                    for coll in collections:
-                                        response_parts.append(f"### {coll['name']}")
-                                        response_parts.append(f"- **Documents:** {coll.get('document_count', 0)}")
-                                        response_parts.append(f"- **Fields:** {coll.get('field_count', 0)}")
-                                        if coll.get("description"):
-                                            response_parts.append(f"- **Description:** {coll['description']}")
-                                        response_parts.append("")
-                                else:
-                                    response_parts.append(f"No collections found for database '{database_name}'.")
-                        
-                        elif schema_query["query_type"] == "fields":
-                            # Show fields for a collection
-                            collection_name = schema_query.get("collection_name")
-                            database_name = schema_query.get("database_name") or st.session_state.mongodb_db_name
-                            
-                            if collection_name and database_name:
-                                fields = kg_rag.get_fields_for_collection(collection_name, database_name)
-                                if fields:
-                                    response_parts.append(f"## 📊 Fields in {collection_name} collection\n\n")
-                                    for field in fields:
-                                        types_str = ", ".join(field.get("types", [])) if isinstance(field.get("types"), list) else field.get("types", "N/A")
-                                        nullable_str = " (nullable)" if field.get("nullable") else " (not null)"
-                                        response_parts.append(f"### {field['name']}")
-                                        response_parts.append(f"- **Types:** {types_str}{nullable_str}")
-                                        if field.get("example"):
-                                            response_parts.append(f"- **Example:** {field['example']}")
-                                        if field.get("description"):
-                                            response_parts.append(f"- **Description:** {field['description']}")
-                                        response_parts.append("")
-                                else:
-                                    response_parts.append(f"No fields found for collection '{collection_name}' in database '{database_name}'.")
-                            else:
-                                response_parts.append("Please specify a collection name. Example: 'show fields in vendors collection'")
-                        
                         if response_parts:
                             full_response = "\n".join(response_parts)
                             st.markdown(full_response)
@@ -913,18 +868,6 @@ def main():
                         if missing["tables"] or missing["columns"]:
                             summary_parts.append("\n💡 **Tip:** Some PostgreSQL tables and columns don't have descriptions.")
                     
-                    # MongoDB summary
-                    if st.session_state.mongodb_connected and st.session_state.mongodb_schema_loaded and st.session_state.schema_rag.knowledge_graph_rag:
-                        mongo_schema = st.session_state.mongodb_client.fetch_schema()
-                        if mongo_schema:
-                            mongo_summary = f"## 🍃 MongoDB Database: {st.session_state.mongodb_db_name}\n\n"
-                            mongo_summary += f"**Collections:** {len(mongo_schema.get('collections', []))}\n\n"
-                            for collection in mongo_schema.get("collections", []):
-                                mongo_summary += f"### Collection: {collection['name']}\n"
-                                mongo_summary += f"- Document Count: {collection.get('document_count', 0)}\n"
-                                mongo_summary += f"- Fields: {len(collection.get('fields', []))}\n\n"
-                            summary_parts.append(mongo_summary)
-                    
                     if summary_parts:
                         full_summary = "\n\n---\n\n".join(summary_parts)
                         st.markdown(full_summary)
@@ -953,26 +896,17 @@ def main():
                 logger.info("Detected query example in user message")
                 query_example = st.session_state.query_example_handler.parse_query_example(prompt)
                 
-                if query_example and (st.session_state.schema_loaded or st.session_state.mongodb_schema_loaded):
+                if query_example and st.session_state.schema_loaded:
                     try:
                         # Store query example in knowledge graph
                         if st.session_state.schema_rag.knowledge_graph_rag:
-                            # Determine which database to use based on entity type
-                            database_name = None
-                            if query_example.get("table_name"):
-                                # PostgreSQL table/column
-                                database_name = st.session_state.postgres_db_name
-                            elif query_example["entity_type"] == "collection":
-                                # MongoDB collection
-                                database_name = st.session_state.mongodb_db_name
-                            else:
-                                # Default to PostgreSQL if available, else MongoDB
-                                database_name = st.session_state.postgres_db_name or st.session_state.mongodb_db_name
+                            database_name = st.session_state.postgres_db_name
                             
                             st.session_state.schema_rag.knowledge_graph_rag.add_query_example(
                                 entity_type=query_example["entity_type"],
                                 entity_name=query_example["entity_name"],
                                 query=query_example["query"],
+                                natural_language=query_example.get("description") or prompt[:200],
                                 description=query_example.get("description", ""),
                                 table_name=query_example.get("table_name"),
                                 database_name=database_name
@@ -1004,18 +938,16 @@ def main():
             # Note: Annotation handling is now done by unified intent classifier above
             # This section is kept for fallback if unified classifier is not available
             
-            # Check if any database is connected
-            if not st.session_state.connected and not st.session_state.mongodb_connected:
-                st.warning("⚠️ Please connect to at least one database (PostgreSQL or MongoDB).")
+            if not st.session_state.connected:
+                st.warning("⚠️ Please connect to a SQL database (PostgreSQL).")
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": "⚠️ Please connect to at least one database (PostgreSQL or MongoDB)."
+                    "content": "⚠️ Please connect to a SQL database (PostgreSQL)."
                 })
                 st.rerun()
                 return
             
-            # Check if model is loaded
-            if st.session_state.sql_generator is None and st.session_state.mongodb_query_generator is None:
+            if st.session_state.sql_generator is None:
                 st.warning("⚠️ Please load an LLM model from the sidebar first.")
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -1032,16 +964,7 @@ def main():
                     schema_rag=st.session_state.schema_rag,
                     response_generator=st.session_state.response_generator,
                     query_classifier=st.session_state.query_classifier,
-                    max_retries=3
-                )
-            
-            if st.session_state.mongodb_connected and st.session_state.mongodb_workflow_agent is None:
-                st.session_state.mongodb_workflow_agent = MongoDBWorkflowAgent(
-                    mongodb_query_generator=st.session_state.mongodb_query_generator,
-                    mongodb_client=st.session_state.mongodb_client,
-                    knowledge_graph_rag=st.session_state.schema_rag.knowledge_graph_rag if st.session_state.schema_rag.knowledge_graph_rag else None,
-                    response_generator=st.session_state.response_generator,
-                    max_retries=3
+                    max_retries=2
                 )
             
             # Initialize orchestrator agent if needed
@@ -1052,10 +975,8 @@ def main():
                 
                 st.session_state.orchestrator_agent = OrchestratorAgent(
                     postgres_workflow_agent=st.session_state.workflow_agent,
-                    mongodb_workflow_agent=st.session_state.mongodb_workflow_agent,
                     database_router=st.session_state.database_router,
                     postgres_client=st.session_state.db_client,
-                    mongodb_client=st.session_state.mongodb_client,
                     schema_rag=st.session_state.schema_rag
                 )
             
@@ -1080,19 +1001,15 @@ def main():
             if result.get("steps"):
                 with steps_container:
                     st.markdown("### 🔄 Workflow Steps")
-                    for step in result["steps"]:
+                    for step in _normalize_workflow_steps(result["steps"]):
                         step_status = step.get("status", "pending")
                         step_icon = "⏳" if step_status == "in_progress" else "✅" if step_status == "completed" else "❌"
                         status_color = "blue" if step_status == "in_progress" else "green" if step_status == "completed" else "red"
                         
-                        # Check if this is a MongoDB query step
-                        is_mongodb = "mongodb_query" in step or "MongoDB" in step.get('name', '')
-                        is_postgres = "sql_query" in step or "PostgreSQL" in step.get('name', '')
                         is_orchestrator = "Orchestrator" in step.get('name', '') or "Query Classification" in step.get('name', '') or "Database Routing" in step.get('name', '')
                         
-                        query_key = "mongodb_query" if is_mongodb else "sql_query"
-                        
                         step_name = step.get('name', '')
+                        display_num = step.get("_display_num", step.get("step", 0))
                         is_retry = 'retry' in step_name.lower() or 'fix' in step_name.lower() or 'fixed' in step_name.lower()
                         is_sql_gen = 'sql generation' in step_name.lower() or 'query generation' in step_name.lower()
                         is_fix_attempt = 'query fix' in step_name.lower() and step_status == "in_progress"
@@ -1101,7 +1018,7 @@ def main():
                         # Expand orchestrator steps, retries, errors, and query generation by default
                         expanded = True if (is_orchestrator or is_retry or step_status == "error" or is_sql_gen) else False
                         
-                        with st.expander(f"{step_icon} Step {step.get('step')}: {step_name}", expanded=expanded):
+                        with st.expander(f"{step_icon} Step {display_num}: {step_name}", expanded=expanded):
                             st.markdown(f"**Status:** :{status_color}[{step_status}]")
                             st.markdown(f"**Details:** {step.get('message', '')}")
                             
@@ -1109,42 +1026,21 @@ def main():
                             if step.get('error'):
                                 st.error(f"**Error:** {step.get('error')}")
                             
-                            # Show query (SQL or MongoDB) if present
-                            query = step.get('sql_query') or step.get('mongodb_query')
+                            # Show SQL query if present
+                            query = step.get('sql_query')
                             if query:
-                                if is_mongodb:
-                                    # MongoDB query display
-                                    if isinstance(query, dict):
-                                        query_str = json.dumps(query, indent=2)
-                                    else:
-                                        query_str = str(query)
-                                    
-                                    if is_fix_attempt:
-                                        st.warning("**Failed MongoDB Query (being fixed):**")
-                                        st.code(query_str, language="json")
-                                    elif is_fixed:
-                                        st.success("**Fixed MongoDB Query (new):**")
-                                        st.code(query_str, language="json")
-                                    elif is_retry:
-                                        st.markdown("**MongoDB Query (Retry):**")
-                                        st.code(query_str, language="json")
-                                    else:
-                                        st.markdown("**MongoDB Query:**")
-                                        st.code(query_str, language="json")
+                                if is_fix_attempt:
+                                    st.warning("**Failed SQL Query (being fixed):**")
+                                    st.code(query, language="sql")
+                                elif is_fixed:
+                                    st.success("**Fixed SQL Query (new):**")
+                                    st.code(query, language="sql")
+                                elif is_retry:
+                                    st.markdown("**SQL Query (Retry):**")
+                                    st.code(query, language="sql")
                                 else:
-                                    # SQL query display
-                                    if is_fix_attempt:
-                                        st.warning("**Failed SQL Query (being fixed):**")
-                                        st.code(query, language="sql")
-                                    elif is_fixed:
-                                        st.success("**Fixed SQL Query (new):**")
-                                        st.code(query, language="sql")
-                                    elif is_retry:
-                                        st.markdown("**SQL Query (Retry):**")
-                                        st.code(query, language="sql")
-                                    else:
-                                        st.markdown("**SQL Query:**")
-                                        st.code(query, language="sql")
+                                    st.markdown("**SQL Query:**")
+                                    st.code(query, language="sql")
             
             # Show generated queries if available (from sub-workflows or direct)
             queries_shown = False
@@ -1153,27 +1049,9 @@ def main():
                     st.code(result["postgres_result"]["sql_query"], language="sql")
                 queries_shown = True
             
-            if result.get("mongodb_result") and result["mongodb_result"].get("mongodb_query"):
-                with st.expander("🔍 View Generated MongoDB Query", expanded=False):
-                    query = result["mongodb_result"]["mongodb_query"]
-                    if isinstance(query, dict):
-                        st.code(json.dumps(query, indent=2), language="json")
-                    else:
-                        st.code(str(query), language="json")
-                queries_shown = True
-            
-            # Fallback to direct query fields if sub-results not available
-            if not queries_shown:
-                if result.get("sql_query"):
-                    with st.expander("🔍 View Generated SQL Query", expanded=False):
-                        st.code(result["sql_query"], language="sql")
-                elif result.get("mongodb_query"):
-                    with st.expander("🔍 View Generated MongoDB Query", expanded=False):
-                        query = result["mongodb_query"]
-                        if isinstance(query, dict):
-                            st.code(json.dumps(query, indent=2), language="json")
-                        else:
-                            st.code(str(query), language="json")
+            if not queries_shown and result.get("sql_query"):
+                with st.expander("🔍 View Generated SQL Query", expanded=False):
+                    st.code(result["sql_query"], language="sql")
             
             # Display final response
             final_response = result.get("final_response", "No response generated.")
@@ -1182,45 +1060,30 @@ def main():
             # Display results if available - check both direct df and from sub-results
             df = result.get("df")
             
-            # If df not in main result, check sub-results
-            if df is None:
-                if result.get("mongodb_result"):
-                    df = result["mongodb_result"].get("df")
-                elif result.get("postgres_result"):
-                    df = result["postgres_result"].get("df")
+            if df is None and result.get("postgres_result"):
+                df = result["postgres_result"].get("df")
+
+            if df is not None and isinstance(df, pd.DataFrame) and len(df) > 0:
+                _render_result_with_chart_option(df, key_prefix="result")
             
-            if df is not None:
-                if isinstance(df, pd.DataFrame) and len(df) > 0:
-                    st.dataframe(df, use_container_width=True)
-                elif isinstance(df, dict):
-                    # Handle MongoDB results that might be in dict format
-                    documents = df.get("documents", [])
-                    if documents:
-                        df_dataframe = pd.DataFrame(documents)
-                        st.dataframe(df_dataframe, use_container_width=True)
-            
-            # Store in messages
-            # Extract queries and results from sub-results if available
             sql_query = result.get("sql_query")
-            mongodb_query = result.get("mongodb_query")
-            query_results_df = df  # Use the df we already extracted above
-            
+            query_results_df = df
             if result.get("postgres_result"):
                 sql_query = result["postgres_result"].get("sql_query") or sql_query
-                # Also get df from postgres result if not already set
                 if query_results_df is None:
                     query_results_df = result["postgres_result"].get("df")
-            if result.get("mongodb_result"):
-                mongodb_query = result["mongodb_result"].get("mongodb_query") or mongodb_query
-                # Also get df from mongodb result if not already set
-                if query_results_df is None:
-                    query_results_df = result["mongodb_result"].get("df")
-            
+
+            # Store last 3 user queries (for DB_QUERY that reached orchestrator)
+            if prompt and (query_results_df is not None or result.get("postgres_result")):
+                recent = getattr(st.session_state, "recent_user_queries", [])
+                if prompt not in recent:
+                    recent = [prompt] + [q for q in recent if q != prompt][:2]
+                    st.session_state.recent_user_queries = recent[:3]
+
             message_entry = {
                 "role": "assistant",
                 "content": final_response,
                 "sql_query": sql_query,
-                "mongodb_query": mongodb_query,
                 "steps": result.get("steps", []),
                 "query_results": query_results_df
             }
