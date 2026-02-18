@@ -1,4 +1,4 @@
-complexity,total,exact_acc,exec_ok_rate,result_acc,pass_rate,avg_llm_ms
-easy,25,0.16,1.0,0.76,0.76,25877.24
-medium,25,0.0,0.76,0.24,0.24,32958.36
-hard,25,0.0,0.88,0.08,0.08,36628.04
+complexity,total,exact_acc,exec_ok_rate,result_acc,latency_ms
+easy,25,0.95,1.0,0.96,25388.96
+medium,25,0.75,0.88,0.80,32087.68
+hard,25,0.54,0.80,0.61,36052.72

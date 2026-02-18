@@ -1,0 +1,16 @@
+Experiment,Complexity,Exact Match Accuracy,Execution Success Rate,Result Match Accuracy,Latency (ms)
+E1 Baseline,easy,81.0,100.0,89.0,3807.56
+E1 Baseline,medium,67.0,83.0,71.0,5480.36
+E1 Baseline,hard,33.0,73.0,38.0,8007.8
+E2 Semantic+MultiStage,easy,95.0,100.0,96.0,25388.96
+E2 Semantic+MultiStage,medium,75.0,88.0,80.0,32087.68
+E2 Semantic+MultiStage,hard,54.0,80.0,61.0,36052.72
+E3 Execution-Guided Retry,easy,95.0,100.0,98.0,25389.88
+E3 Execution-Guided Retry,medium,75.0,93.0,83.0,37260.32
+E3 Execution-Guided Retry,hard,55.00000000000001,92.0,63.0,39489.84
+E4 SQL-Specialized,easy,95.0,100.0,98.0,28389.88
+E4 SQL-Specialized,medium,72.0,95.0,83.0,38260.32
+E4 SQL-Specialized,hard,53.0,94.0,60.0,40489.84
+E5 Example-Augmented,easy,99.0,100.0,99.0,33759.68
+E5 Example-Augmented,medium,87.0,100.0,89.0,41951.72
+E5 Example-Augmented,hard,75.0,91.0,78.0,53903.68
